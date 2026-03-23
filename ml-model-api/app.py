@@ -16,6 +16,8 @@ from ab_testing import ABTestManager
 from deployment_manager import ModelDeploymentManager, DeploymentConfig
 from model_validator import ModelValidator, ValidationConfig
 from api_endpoints import register_all_endpoints
+from batch_processor import BatchProcessor
+from batch_endpoints import register_batch_endpoints
 
 app = Flask(__name__)
 
@@ -26,6 +28,9 @@ deployment_config = DeploymentConfig()
 deployment_manager = ModelDeploymentManager(model_registry, deployment_config)
 validation_config = ValidationConfig()
 model_validator = ModelValidator(model_registry, validation_config)
+
+# Initialize batch processor
+batch_processor = BatchProcessor(model_registry, ab_test_manager)
 
 # Model cache
 cached_models = {}
@@ -169,6 +174,9 @@ def predict():
 
 # Register all management endpoints
 register_all_endpoints(app, model_registry, ab_test_manager, deployment_manager, model_validator)
+
+# Register batch processing endpoints
+register_batch_endpoints(app, batch_processor)
 
 if __name__ == '__main__':
     # Register existing model if not already registered
