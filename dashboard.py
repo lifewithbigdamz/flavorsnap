@@ -1,3 +1,4 @@
+from src.ui import theme_manager
 import panel as pn
 import torch
 import torchvision.transforms as transforms
@@ -6,7 +7,8 @@ from PIL import Image
 import io
 import os
 
-pn.extension()
+# Configure Panel Extension and Theme Integration
+theme_manager.apply_to_app()
 
 # Load model
 model_path = 'models/best_model.pth'
@@ -29,11 +31,14 @@ def save_image(image_obj, predicted_class, image_name="uploaded_image.jpg"):
     image_path = os.path.join(save_dir, image_name)
     image_obj.save(image_path)
 
-# Panel UI
+# Panel UI Components
 image_input = pn.widgets.FileInput(accept='image/*')
 output = pn.pane.Markdown("Upload an image of food 🍲")
 image_preview = pn.pane.Image(width=300, height=300, visible=False)
 spinner = pn.indicators.LoadingSpinner(value=False, width=50)
+
+# Theme Toggle from ThemeManager
+theme_toggle = theme_manager.get_header_toggle_btn()
 
 def classify(event=None):
     if image_input.value is None:
@@ -46,7 +51,6 @@ def classify(event=None):
         # Update preview
         image_preview.object = image
         image_preview.visible = True
-
 
         # Start spinner
         spinner.value = True
@@ -70,14 +74,26 @@ def classify(event=None):
 run_button = pn.widgets.Button(name='Classify', button_type='primary')
 run_button.on_click(classify)
 
+# Header Section
+header = pn.Row(
+    pn.pane.Markdown("# 🍽️ FlavorSnap", styles={'margin-top': '0px', 'flex': '1'}),
+    theme_toggle,
+    sizing_mode='stretch_width',
+    css_classes=['header']
+)
+
+# Dashboard Layout
 app = pn.Column(
-    "# 🍽️ FlavorSnap",
-    "Upload an image and click the button to classify your food!",
-    image_input,
-    run_button,
-    spinner,
-    image_preview,
-    output,
+    header,
+    pn.layout.Divider(),
+    pn.pane.Markdown("Upload an image and click the button to classify your food! 🥗", styles={'font-size': '1.1rem'}),
+    pn.Row(
+        pn.Column(image_input, run_button, spinner),
+        pn.Column(image_preview, output),
+        sizing_mode='stretch_width'
+    ),
+    sizing_mode='stretch_width',
+    css_classes=['dashboard-container']
 )
 
 app.servable()
