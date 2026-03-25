@@ -948,32 +948,32 @@ npm run test
 npm run test:coverage
 npm run test:e2e
 
-# Backend tests
-cd ml-model-api
-python -m pytest
-python -m pytest --cov=app
+# Backend (FastAPI API + Panel UI) tests
+# Runs only tests under `tests/` (see repo `pyproject.toml`).
+python scripts/run_tests.py
 
-# Integration tests
-npm run test:integration
+# Same suite with coverage (enforces 90%+).
+python scripts/coverage_report.py
+
+# Performance benchmarks
+python scripts/run_tests.py --performance-smoke
+python scripts/run_tests.py --performance-full
 ```
 
 ### Test Structure
 
 ```
 tests/
-├── 📁 frontend/
-│   ├── 📁 components/          # Component tests
-│   ├── 📁 pages/              # Page tests
-│   └── 📁 utils/              # Utility tests
-├── 📁 backend/
-│   ├── 📁 api/                # API endpoint tests
-│   └── 📁 model/              # Model tests
-└── 📁 e2e/                    # End-to-end tests
+├── 📁 api/                    # FastAPI endpoint tests (existing)
+├── 📁 unit/                   # Core module unit tests
+├── 📁 integration/            # API/UI integration tests
+└── 📁 performance/           # pytest-benchmark performance checks
 ```
 
 ### Test Data
 
-Test images are available in `tests/fixtures/images/` with proper labels for validation.
+Most Python fixtures are generated deterministically at runtime (see `tests/conftest.py`).
+Any on-disk lightweight assets live under `tests/fixtures/`.
 
 ## 📊 Model Information
 
