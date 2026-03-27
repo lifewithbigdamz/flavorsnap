@@ -1,8 +1,11 @@
 import json
+import logging
 from datetime import datetime, date
 from typing import Any, Dict, Optional
 
 from db_config import get_connection
+
+logger = logging.getLogger(__name__)
 
 
 def _ensure_uuid_func(cur):
@@ -21,6 +24,7 @@ def _ensure_uuid_func(cur):
 def log_prediction_history(payload: Dict[str, Any], duration: float, status: str, request_meta: Optional[Dict[str, Any]] = None):
     conn = get_connection()
     if not conn:
+        logger.warning("Database unavailable — skipping prediction history logging")
         return
     try:
         with conn:
@@ -114,6 +118,8 @@ def log_prediction_history(payload: Dict[str, Any], duration: float, status: str
                         duration if isinstance(duration, (int, float)) else None,
                     ),
                 )
+    except Exception as exc:
+        logger.error("Failed to log prediction history: %s", exc)
     finally:
         try:
             conn.close()
@@ -124,6 +130,7 @@ def log_prediction_history(payload: Dict[str, Any], duration: float, status: str
 def purge_old_history(days: int) -> int:
     conn = get_connection()
     if not conn:
+        logger.warning("Database unavailable — skipping history purge")
         return 0
     try:
         with conn:
@@ -137,6 +144,9 @@ def purge_old_history(days: int) -> int:
                 )
                 deleted = cur.rowcount
                 return deleted or 0
+    except Exception as exc:
+        logger.error("Failed to purge old history: %s", exc)
+        return 0
     finally:
         try:
             conn.close()
