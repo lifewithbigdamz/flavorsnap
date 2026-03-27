@@ -2,10 +2,16 @@ import { useState, useEffect, useCallback } from 'react';
 import {
   blockchainManager,
   WalletInfo,
+  TokenInfo,
+  VestingSchedule,
   TransactionResult,
   DataSource,
   ChainTransactionRow,
   BlockchainUserError,
+  BackendHealthResult,
+  describeLocalFallbackReason,
+  pickWorstLocalFallback,
+  LocalFallbackReason,
 } from '@/lib/blockchain';
 
 function summarizeTxResult(label: string, result: TransactionResult): string {
@@ -31,6 +37,20 @@ export function BlockchainWallet() {
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [infoMessage, setInfoMessage] = useState<string | null>(null);
+  const [backendHealth, setBackendHealth] = useState<BackendHealthResult | null>(null);
+  const [healthChecking, setHealthChecking] = useState(false);
+  const [vestingFallbackMeta, setVestingFallbackMeta] = useState<{ reason?: LocalFallbackReason; detail?: string }>({});
+  const [txFallbackMeta, setTxFallbackMeta] = useState<{ reason?: LocalFallbackReason; detail?: string }>({});
+
+  const refreshBackendHealth = useCallback(async () => {
+    setHealthChecking(true);
+    try {
+      const h = await blockchainManager.getBackendHealth();
+      setBackendHealth(h);
+    } finally {
+      setHealthChecking(false);
+    }
+  }, []);
 
   const loadTokenInfo = useCallback(async (publicKey: string) => {
     try {
@@ -45,25 +65,35 @@ export function BlockchainWallet() {
 
   const loadVestingSchedules = useCallback(async (publicKey: string) => {
     try {
-      const { schedules, dataSource } = await blockchainManager.getVestingSchedules(publicKey);
+      const { schedules, dataSource, localFallbackReason, localFallbackDetail } =
+        await blockchainManager.getVestingSchedules(publicKey);
       setVestingSchedules(schedules);
       setVestingSource(dataSource);
+      setVestingFallbackMeta(
+        dataSource === 'backend' ? {} : { reason: localFallbackReason, detail: localFallbackDetail },
+      );
     } catch (err) {
       console.error('Failed to load vesting schedules:', err);
       setVestingSchedules([]);
       setVestingSource('local');
+      setVestingFallbackMeta({ reason: 'server_error', detail: err instanceof Error ? err.message : undefined });
     }
   }, []);
 
   const loadTransactionHistory = useCallback(async (publicKey: string) => {
     try {
-      const { transactions, dataSource } = await blockchainManager.getTransactionHistory(publicKey, 10);
+      const { transactions, dataSource, localFallbackReason, localFallbackDetail } =
+        await blockchainManager.getTransactionHistory(publicKey, 10);
       setTransactionHistory(transactions);
       setTxSource(dataSource);
+      setTxFallbackMeta(
+        dataSource === 'backend' ? {} : { reason: localFallbackReason, detail: localFallbackDetail },
+      );
     } catch (err) {
       console.error('Failed to load transaction history:', err);
       setTransactionHistory([]);
       setTxSource('local');
+      setTxFallbackMeta({ reason: 'server_error', detail: err instanceof Error ? err.message : undefined });
     }
   }, []);
 
@@ -108,6 +138,8 @@ export function BlockchainWallet() {
         setTokenSource(null);
         setVestingSource(null);
         setTxSource(null);
+        setVestingFallbackMeta({});
+        setTxFallbackMeta({});
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load wallet info');
@@ -120,6 +152,11 @@ export function BlockchainWallet() {
     if (freighterReady !== true) return;
     void loadWalletInfo();
   }, [freighterReady, loadWalletInfo]);
+
+  useEffect(() => {
+    if (freighterReady !== true) return;
+    void refreshBackendHealth();
+  }, [freighterReady, refreshBackendHealth]);
 
   const handleConnect = async () => {
     try {
@@ -153,6 +190,8 @@ export function BlockchainWallet() {
       setTokenSource(null);
       setVestingSource(null);
       setTxSource(null);
+      setVestingFallbackMeta({});
+      setTxFallbackMeta({});
       const info = await blockchainManager.getWalletInfo();
       setWalletInfo(info);
       setInfoMessage('Disconnected from this session. You can revoke site access from the Freighter extension if needed.');
@@ -175,9 +214,10 @@ export function BlockchainWallet() {
         if (result.backendSyncError) {
           setError(`Server sync issue: ${result.backendSyncError}`);
         }
-        if (walletInfo?.publicKey) {
-          await loadTokenInfo(walletInfo.publicKey);
-          await loadTransactionHistory(walletInfo.publicKey);
+        const live = await blockchainManager.getWalletInfo();
+        if (live.publicKey) {
+          await loadTokenInfo(live.publicKey);
+          await loadTransactionHistory(live.publicKey);
         }
       } else {
         setError(msg);
@@ -248,8 +288,45 @@ export function BlockchainWallet() {
     walletInfo?.isConnected &&
     (tokenSource === 'local' || vestingSource === 'local' || txSource === 'local');
 
+  const worstPreview = pickWorstLocalFallback([
+    { reason: tokenInfo?.localFallbackReason, detail: tokenInfo?.localFallbackDetail },
+    vestingFallbackMeta,
+    txFallbackMeta,
+  ]);
+
   return (
     <div className="bg-white dark:bg-gray-800 rounded-lg shadow-lg p-6 max-w-4xl mx-auto">
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-4 pb-3 border-b border-gray-200 dark:border-gray-700">
+        <p className="text-sm text-gray-600 dark:text-gray-400">
+          API base:{' '}
+          <span className="font-mono text-xs text-gray-900 dark:text-gray-200">{blockchainManager.getBackendBaseUrl()}</span>
+        </p>
+        <div className="flex items-center gap-2">
+          {healthChecking ? (
+            <span className="text-xs text-gray-500">Checking /health…</span>
+          ) : backendHealth ? (
+            <span
+              className={`text-xs font-medium px-2 py-1 rounded ${
+                backendHealth.reachable
+                  ? 'bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-200'
+                  : 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-200'
+              }`}
+            >
+              {backendHealth.reachable
+                ? `API up${backendHealth.httpStatus != null ? ` (${backendHealth.httpStatus})` : ''}`
+                : `API unreachable${backendHealth.message ? `: ${backendHealth.message}` : ''}`}
+            </span>
+          ) : null}
+          <button
+            type="button"
+            onClick={() => void refreshBackendHealth()}
+            className="text-xs font-medium text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"
+          >
+            Refresh status
+          </button>
+        </div>
+      </div>
+
       {infoMessage && (
         <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-4 mb-4 dark:bg-emerald-950/30 dark:border-emerald-800">
           <p className="text-emerald-900 dark:text-emerald-100 text-sm font-medium">{infoMessage}</p>
@@ -258,12 +335,19 @@ export function BlockchainWallet() {
 
       {showLocalDataBanner && (
         <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 mb-4 dark:bg-amber-950/30 dark:border-amber-800">
-          <p className="text-amber-900 dark:text-amber-100 text-sm">
-            Some data is running in <strong>offline preview</strong> mode because the FlavorSnap blockchain API at{' '}
-            <span className="font-mono text-xs">{blockchainManager.getBackendBaseUrl()}</span> did not return token,
-            vesting, or history records. Start the API server and add <code className="text-xs">/api/blockchain/*</code>{' '}
-            routes, or set <code className="text-xs">NEXT_PUBLIC_BLOCKCHAIN_BACKEND_URL</code>.
+          <p className="text-amber-900 dark:text-amber-100 text-sm font-medium mb-1">
+            Offline preview — blockchain REST data is not loaded from the server
           </p>
+          <p className="text-amber-900 dark:text-amber-100 text-sm">
+            {worstPreview
+              ? describeLocalFallbackReason(worstPreview.reason, worstPreview.detail)
+              : 'Configure NEXT_PUBLIC_BLOCKCHAIN_BACKEND_URL if the API is not at the default host, and implement /api/blockchain/token-info, /vesting, and /transactions on the backend.'}
+          </p>
+          {backendHealth?.reachable && worstPreview?.reason === 'routes_missing' ? (
+            <p className="text-amber-800 dark:text-amber-200/90 text-xs mt-2">
+              /health responded OK, so your process is running — only the blockchain routes need to be wired up.
+            </p>
+          ) : null}
         </div>
       )}
 

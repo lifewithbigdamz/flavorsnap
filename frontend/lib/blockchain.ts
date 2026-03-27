@@ -16,6 +16,9 @@ export interface WalletInfo {
 
 export type DataSource = 'backend' | 'local';
 
+/** Why we fell back to local preview data (for user-facing copy) */
+export type LocalFallbackReason = 'unreachable' | 'routes_missing' | 'timeout' | 'server_error' | 'invalid_response';
+
 export interface TokenInfo {
   name: string;
   symbol: string;
@@ -23,6 +26,8 @@ export interface TokenInfo {
   totalSupply: string;
   balance: string;
   dataSource?: DataSource;
+  localFallbackReason?: LocalFallbackReason;
+  localFallbackDetail?: string;
 }
 
 export interface VestingSchedule {
@@ -67,6 +72,20 @@ export interface ChainTransactionRow {
   status: string;
 }
 
+export interface VestingSchedulesResult {
+  schedules: VestingSchedule[];
+  dataSource: DataSource;
+  localFallbackReason?: LocalFallbackReason;
+  localFallbackDetail?: string;
+}
+
+export interface TransactionHistoryResult {
+  transactions: ChainTransactionRow[];
+  dataSource: DataSource;
+  localFallbackReason?: LocalFallbackReason;
+  localFallbackDetail?: string;
+}
+
 // ——— Errors ———
 
 function freighterMessage(err: unknown): string {
@@ -86,6 +105,7 @@ export class BlockchainUserError extends Error {
 // ——— Backend (Express / api routes under /api/blockchain/*) ———
 
 const BACKEND_TIMEOUT_MS = 15000;
+const HEALTH_TIMEOUT_MS = 5000;
 
 function getBlockchainBackendBaseUrl(): string {
   const fromEnv =
@@ -95,12 +115,67 @@ function getBlockchainBackendBaseUrl(): string {
   return raw;
 }
 
+function classifyBackendFailure(error: string, status?: number): LocalFallbackReason {
+  const low = error.toLowerCase();
+  if (status === 408 || low.includes('timeout')) return 'timeout';
+  if (status === 404 || error.includes('HTTP 404') || /\b404\b/.test(error)) return 'routes_missing';
+  if (error.includes('Cannot reach blockchain backend') || error.includes('Failed to fetch') || error.includes('NetworkError'))
+    return 'unreachable';
+  if (status !== undefined && status >= 500) return 'server_error';
+  return 'server_error';
+}
+
+export function describeLocalFallbackReason(reason: LocalFallbackReason, detail?: string): string {
+  const suffix = detail ? ` ${detail}` : '';
+  switch (reason) {
+    case 'unreachable':
+      return `The FlavorSnap API at your configured URL is unreachable.${suffix}`;
+    case 'routes_missing':
+      return `The server is up, but blockchain REST routes are not available (404). Add /api/blockchain/* on the backend.${suffix}`;
+    case 'timeout':
+      return `The API did not respond in time.${suffix}`;
+    case 'invalid_response':
+      return `The API returned data we could not parse for this view.${suffix}`;
+    case 'server_error':
+    default:
+      return `The API returned an error.${suffix}`;
+  }
+}
+
+/** Higher = worse; use to pick the most actionable banner when multiple fetches fail */
+export function fallbackReasonSeverity(reason: LocalFallbackReason): number {
+  const order: LocalFallbackReason[] = [
+    'invalid_response',
+    'routes_missing',
+    'server_error',
+    'timeout',
+    'unreachable',
+  ];
+  return order.indexOf(reason);
+}
+
+export function pickWorstLocalFallback(
+  entries: Array<{ reason?: LocalFallbackReason; detail?: string }>,
+): { reason: LocalFallbackReason; detail?: string } | null {
+  let picked: { reason: LocalFallbackReason; detail?: string } | null = null;
+  let worstScore = -1;
+  for (const e of entries) {
+    if (!e.reason) continue;
+    const s = fallbackReasonSeverity(e.reason);
+    if (s > worstScore) {
+      worstScore = s;
+      picked = { reason: e.reason, detail: e.detail };
+    }
+  }
+  return picked;
+}
+
 async function backendFetchJson<T>(
   method: 'GET' | 'POST',
   pathname: string,
   query?: Record<string, string | number | undefined>,
   body?: Record<string, unknown>,
-): Promise<{ ok: true; data: T } | { ok: false; error: string }> {
+): Promise<{ ok: true; data: T } | { ok: false; error: string; status?: number }> {
   const base = getBlockchainBackendBaseUrl();
   const url = new URL(pathname.startsWith('/') ? pathname : `/${pathname}`, `${base}/`);
   if (query) {
@@ -137,7 +212,7 @@ async function backendFetchJson<T>(
         parsed && typeof parsed === 'object' && 'error' in parsed && typeof (parsed as { error: unknown }).error === 'string'
           ? (parsed as { error: string }).error
           : text || `HTTP ${res.status}`;
-      return { ok: false, error: msg };
+      return { ok: false, error: msg, status: res.status };
     }
 
     return { ok: true, data: parsed as T };
@@ -151,6 +226,42 @@ async function backendFetchJson<T>(
       return { ok: false, error: 'Cannot reach blockchain backend. Is the API server running?' };
     }
     return { ok: false, error: msg };
+  }
+}
+
+export interface BackendHealthResult {
+  reachable: boolean;
+  httpStatus?: number;
+  /** Server body message or error text */
+  message?: string;
+}
+
+async function fetchBackendHealth(): Promise<BackendHealthResult> {
+  const base = getBlockchainBackendBaseUrl();
+  const url = new URL('/health', `${base}/`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url.toString(), { method: 'GET', signal: controller.signal, headers: { Accept: 'application/json' } });
+    clearTimeout(timer);
+    const text = await res.text();
+    let message: string | undefined;
+    try {
+      const j = text ? JSON.parse(text) : null;
+      if (j && typeof j === 'object' && 'status' in j) message = String((j as { status: unknown }).status);
+    } catch {
+      message = text?.slice(0, 200);
+    }
+    return { reachable: res.ok, httpStatus: res.status, message: message || (res.ok ? 'OK' : text?.slice(0, 200)) };
+  } catch (e) {
+    clearTimeout(timer);
+    if (e instanceof Error && e.name === 'AbortError') {
+      return { reachable: false, message: 'Health check timed out' };
+    }
+    return {
+      reachable: false,
+      message: e instanceof Error ? e.message : 'Network error',
+    };
   }
 }
 
@@ -241,6 +352,20 @@ export class BlockchainManager {
   /** Base URL used for FlavorSnap blockchain REST endpoints */
   getBackendBaseUrl(): string {
     return getBlockchainBackendBaseUrl();
+  }
+
+  /**
+   * Calls GET /health on the configured API base (Express serves this today).
+   * Use for UI status; blockchain data still uses /api/blockchain/* when implemented.
+   */
+  async getBackendHealth(): Promise<BackendHealthResult> {
+    return fetchBackendHealth();
+  }
+
+  private async getAuthorizedPublicKey(): Promise<string | null> {
+    const a = await getAddress();
+    if (a.error || !a.address) return null;
+    return a.address;
   }
 
   private mapFreighterNetwork(network: string | undefined): 'public' | 'testnet' {
@@ -351,6 +476,25 @@ export class BlockchainManager {
 
     if (res.ok && res.data && typeof res.data === 'object') {
       const d = res.data;
+      const hasCore =
+        typeof d.name === 'string' ||
+        typeof d.symbol === 'string' ||
+        typeof d.balance === 'string' ||
+        typeof d.balance === 'number';
+      if (!hasCore && Object.keys(d).length > 0) {
+        const reason: LocalFallbackReason = 'invalid_response';
+        const balance = await mockTokenBalance(address);
+        return {
+          name: 'FlavorToken',
+          symbol: 'FLV',
+          decimals: 7,
+          totalSupply: '1000000.0000000',
+          balance,
+          dataSource: 'local',
+          localFallbackReason: reason,
+          localFallbackDetail: 'token-info response missing name/symbol/balance',
+        };
+      }
       const name = typeof d.name === 'string' ? d.name : 'FlavorToken';
       const symbol = typeof d.symbol === 'string' ? d.symbol : 'FLV';
       const decimals = typeof d.decimals === 'number' ? d.decimals : 7;
@@ -361,6 +505,7 @@ export class BlockchainManager {
 
     try {
       const balance = await mockTokenBalance(address);
+      const reason = classifyBackendFailure(res.error, res.status);
       return {
         name: 'FlavorToken',
         symbol: 'FLV',
@@ -368,6 +513,8 @@ export class BlockchainManager {
         totalSupply: '1000000.0000000',
         balance,
         dataSource: 'local',
+        localFallbackReason: reason,
+        localFallbackDetail: res.error,
       };
     } catch (error) {
       console.error('Failed to get token info:', error);
@@ -393,7 +540,10 @@ export class BlockchainManager {
         return { success: false, error: 'Enter a valid amount greater than zero' };
       }
 
-      const from = (await getAddress()).address;
+      const from = await this.getAuthorizedPublicKey();
+      if (!from) {
+        return { success: false, error: 'Could not read your Freighter address. Connect the wallet and try again.' };
+      }
       console.log('Minting', amount, 'tokens to', toAddress);
 
       await new Promise((r) => setTimeout(r, 1200));
@@ -435,7 +585,10 @@ export class BlockchainManager {
         return { success: false, error: 'Enter a valid amount greater than zero' };
       }
 
-      const from = (await getAddress()).address;
+      const from = await this.getAuthorizedPublicKey();
+      if (!from) {
+        return { success: false, error: 'Could not read your Freighter address. Connect the wallet and try again.' };
+      }
       console.log('Transferring', amount, 'tokens to', toAddress);
 
       await new Promise((r) => setTimeout(r, 1200));
@@ -484,7 +637,7 @@ export class BlockchainManager {
     }
   }
 
-  async getVestingSchedules(recipient: string): Promise<{ schedules: VestingSchedule[]; dataSource: DataSource }> {
+  async getVestingSchedules(recipient: string): Promise<VestingSchedulesResult> {
     const res = await backendFetchJson<{ schedules?: VestingSchedule[] }>('GET', '/api/blockchain/vesting', {
       recipient: recipient.trim(),
     });
@@ -493,8 +646,15 @@ export class BlockchainManager {
       return { schedules: res.data.schedules, dataSource: 'backend' };
     }
 
-    console.warn('Vesting backend unavailable; using local preview data.', !res.ok ? res.error : '');
-    return { schedules: mockVestingSchedules(recipient), dataSource: 'local' };
+    const reason = res.ok ? 'invalid_response' : classifyBackendFailure(res.error, res.status);
+    const detail = res.ok ? 'Expected { schedules: [...] }' : res.error;
+    console.warn('Vesting backend unavailable; using local preview data.', detail);
+    return {
+      schedules: mockVestingSchedules(recipient),
+      dataSource: 'local',
+      localFallbackReason: reason,
+      localFallbackDetail: detail,
+    };
   }
 
   async releaseVestedFunds(scheduleId: number): Promise<TransactionResult> {
@@ -507,7 +667,10 @@ export class BlockchainManager {
       await new Promise((r) => setTimeout(r, 1200));
       const txHash = '0x' + Math.random().toString(16).slice(2).padEnd(64, '0');
 
-      const from = (await getAddress()).address;
+      const from = await this.getAuthorizedPublicKey();
+      if (!from) {
+        return { success: false, error: 'Could not read your Freighter address. Connect the wallet and try again.' };
+      }
       const sync = await syncTransactionWithBackend({
         txHash,
         type: 'release_vesting',
@@ -549,10 +712,7 @@ export class BlockchainManager {
     return [];
   }
 
-  async getTransactionHistory(
-    address?: string,
-    limit: number = 10,
-  ): Promise<{ transactions: ChainTransactionRow[]; dataSource: DataSource }> {
+  async getTransactionHistory(address?: string, limit: number = 10): Promise<TransactionHistoryResult> {
     const res = await backendFetchJson<{ transactions?: ChainTransactionRow[] }>('GET', '/api/blockchain/transactions', {
       address: address?.trim(),
       limit,
@@ -562,10 +722,14 @@ export class BlockchainManager {
       return { transactions: res.data.transactions.slice(0, limit), dataSource: 'backend' };
     }
 
-    console.warn('Transaction history backend unavailable; using local preview.', !res.ok ? res.error : '');
+    const reason = res.ok ? 'invalid_response' : classifyBackendFailure(res.error, res.status);
+    const detail = res.ok ? 'Expected { transactions: [...] }' : res.error;
+    console.warn('Transaction history backend unavailable; using local preview.', detail);
     return {
       transactions: mockTransactions(address).slice(0, limit),
       dataSource: 'local',
+      localFallbackReason: reason,
+      localFallbackDetail: detail,
     };
   }
 
