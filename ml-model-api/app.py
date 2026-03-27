@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, g
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -9,34 +9,33 @@ import logging
 from functools import wraps
 from datetime import datetime
 
-# Import security modules
 from security_config import (
-    SecurityConfig, InputValidator, APIKeyManager, 
+    SecurityConfig, InputValidator, APIKeyManager,
     RateLimitManager, SecurityMiddleware, SecurityMonitor,
     validate_json_input, is_safe_url
 )
 
-# Import performance monitoring
-from monitoring import MonitoringMiddleware, track_inference, update_model_accuracy
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Import and configure structured logging
+from logger_config import setup_logger
+logger = setup_logger(__name__)
 
 app = Flask(__name__)
 
-# Configuration
+
 class Config:
     SECRET_KEY = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
-    REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379')
+    REDIS_URL = os.environ.get('REDIS_URL', '')
     API_KEYS = os.environ.get('API_KEYS', '').split(',') if os.environ.get('API_KEYS') else []
-    RATE_LIMIT_STORAGE_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379')
     UPLOAD_FOLDER = 'uploads'
+    MAX_CONTENT_LENGTH = SecurityConfig.MAX_CONTENT_LENGTH
     ENV = os.environ.get('FLASK_ENV', 'development')
+    MAX_CONTENT_LENGTH = 10 * 1024 * 1024  # 10MB limit
+
 
 app.config.from_object(Config)
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# Initialize security middleware
+# Security middleware
 security_middleware = SecurityMiddleware(app)
 security_monitor = SecurityMonitor(app)
 
@@ -50,82 +49,57 @@ limiter = Limiter(
     default_limits=["20 per minute"]
 )
 
-# CORS Configuration
-CORS(app, 
+CORS(app,
      origins=['http://localhost:3000', 'https://yourdomain.com'],
      methods=['GET', 'POST', 'PUT', 'DELETE'],
      allow_headers=['Content-Type', 'Authorization', 'X-API-Key'],
      supports_credentials=True)
 
-# Dynamic rate limiting decorator
-def tiered_rate_limit(endpoint_name: str):
-    """Dynamic rate limiting based on API key tier"""
-    def decorator(f):
-        @wraps(f)
-        def decorated_function(*args, **kwargs):
-            api_key = request.headers.get('X-API-Key')
-            rate_limit = RateLimitManager.get_rate_limit_for_endpoint(endpoint_name, api_key)
-            
-            # Apply rate limit using flask-limiter
-            with limiter.limit(rate_limit):
-                return f(*args, **kwargs)
-        return decorated_function
-    return decorator
-# API Key Authentication
+
 def require_api_key(f):
     @wraps(f)
-    def decorated_function(*args, **kwargs):
-        # Skip API key check in development
+    def decorated(*args, **kwargs):
         if app.config.get('ENV') == 'development':
             return f(*args, **kwargs)
-            
         api_key = request.headers.get('X-API-Key')
         if not api_key:
             logger.warning(f"Missing API key from {RateLimitManager.get_client_ip()}")
             return jsonify({'error': 'API key required'}), 401
-        
-        # Validate API key format
         if not InputValidator.validate_api_key(api_key):
             logger.warning(f"Invalid API key format from {RateLimitManager.get_client_ip()}")
             return jsonify({'error': 'Invalid API key format'}), 401
-        
         if api_key not in app.config['API_KEYS']:
             logger.warning(f"Unauthorized API key from {RateLimitManager.get_client_ip()}")
             return jsonify({'error': 'Invalid API key'}), 401
-            
         return f(*args, **kwargs)
-    return decorated_function
+    return decorated
 
-# Rate Limiting for Specific Endpoints
+
 @app.route('/predict', methods=['POST'])
 @tiered_rate_limit('predict')
 @require_api_key
 @track_inference
 def predict():
-    """Food classification endpoint with comprehensive security measures"""
+    """Food classification endpoint"""
     start_time = time.time()
-    
     try:
-        # Validate input using security module
         if 'image' not in request.files:
             return jsonify({'error': 'No image provided'}), 400
-        
+
         file = request.files['image']
-        
-        # Validate file upload
         is_valid, error_msg = InputValidator.validate_file_upload(file)
         if not is_valid:
             logger.warning(f"File validation failed: {error_msg}")
             return jsonify({'error': error_msg}), 400
-        
-        # Generate secure filename
+
         filename = InputValidator.secure_filename_custom(file.filename)
-        
-        # Mock prediction logic (replace with actual model)
+        save_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(save_path)
+
+        # TODO: replace with actual model inference
         processing_time = time.time() - start_time
-        
         logger.info(f"Prediction completed for {filename} in {processing_time:.3f}s")
-        
+
         return jsonify({
             'prediction': 'Sample food',
             'confidence': 0.95,
@@ -133,12 +107,12 @@ def predict():
             'timestamp': datetime.now().isoformat(),
             'request_id': request.headers.get('X-Request-ID', 'unknown')
         })
-        
+
     except Exception as e:
-        logger.error(f"Prediction error: {str(e)}")
+        logger.error(f"Prediction error: {str(e)}", exc_info=True)
         return jsonify({'error': 'Internal server error'}), 500
 
-# Health check endpoint (exempt from rate limiting)
+
 @app.route('/health', methods=['GET'])
 @limiter.exempt
 def health_check():
@@ -226,7 +200,7 @@ def health_check():
             'error': str(e)
         }), 500
 
-# API info endpoint
+
 @app.route('/api/info', methods=['GET'])
 @limiter.limit("30 per minute")
 def api_info():
@@ -288,26 +262,12 @@ def api_info():
         }
     })
 
-# API key generation endpoint (admin only)
+
 @app.route('/admin/api-key/generate', methods=['POST'])
 @tiered_rate_limit('generate_api_key')
 def generate_api_key():
-    """Generate new API key with tier support (admin endpoint)"""
-    if app.config.get('ENV') == 'production':
-        # Add admin authentication here
-        pass
-    
-    # Get tier from request, default to free
-    request_data = request.get_json(silent=True) or {}
-    tier = request_data.get('tier', 'free')
-    
-    if tier not in ['free', 'premium', 'enterprise']:
-        return jsonify({'error': 'Invalid tier. Must be free, premium, or enterprise'}), 400
-    
-    # Generate tiered API key
-    key_info = APIKeyManager.generate_tiered_api_key(tier)
-    logger.info(f"New {tier} API key generated")
-    
+    new_key = APIKeyManager.generate_api_key()
+    logger.info("New API key generated")
     return jsonify({
         'api_key': key_info['api_key'],
         'tier': key_info['tier'],
@@ -350,14 +310,11 @@ def ratelimit_handler(e):
         'endpoint': endpoint
     }), 429
 
+
 @app.errorhandler(404)
 def not_found_handler(e):
     return jsonify({'error': 'Endpoint not found'}), 404
 
-@app.errorhandler(500)
-def internal_error_handler(e):
-    logger.error(f"Internal server error: {str(e)}")
-    return jsonify({'error': 'Internal server error'}), 500
 
 @app.errorhandler(413)
 def request_too_large_handler(e):
@@ -365,6 +322,13 @@ def request_too_large_handler(e):
         'error': 'Request too large',
         'max_size': '16MB'
     }), 413
+
+
+@app.errorhandler(500)
+def internal_error_handler(e):
+    logger.error(f"Internal server error: {str(e)}")
+    return jsonify({'error': 'Internal server error'}), 500
+
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)

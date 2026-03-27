@@ -1,1 +1,7 @@
-
+Flask==3.0.0
+flask-cors==4.0.0
+flask-limiter==3.5.0
+werkzeug==3.0.1
+bleach==6.1.0
+redis==5.0.1
+Pillow==10.2.0

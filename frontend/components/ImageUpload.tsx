@@ -1,13 +1,15 @@
 import { useRef, useState, useCallback, DragEvent, ChangeEvent, TouchEvent } from 'react';
 import { useTranslation } from 'next-i18next';
+import { AppError } from '../types';
 
 interface ImageUploadProps {
   onImageSelect: (file: File, imageUrl: string) => void;
+  onError?: (error: AppError) => void;
   loading?: boolean;
   disabled?: boolean;
 }
 
-export function ImageUpload({ onImageSelect, loading = false, disabled = false }: ImageUploadProps) {
+export function ImageUpload({ onImageSelect, onError, loading = false, disabled = false }: ImageUploadProps) {
   const { t } = useTranslation('common');
   const [isDragging, setIsDragging] = useState(false);
   const [isTouching, setIsTouching] = useState(false);
@@ -51,9 +53,14 @@ export function ImageUpload({ onImageSelect, loading = false, disabled = false }
       if (file.type.startsWith('image/')) {
         const imageUrl = URL.createObjectURL(file);
         onImageSelect(file, imageUrl);
+      } else {
+        onError?.({
+          message: t('error_invalid_image_type', 'Invalid file type. Please upload an image.'),
+          code: 'INVALID_FILE_TYPE'
+        });
       }
     }
-  }, [onImageSelect, disabled, loading]);
+  }, [onImageSelect, onError, disabled, loading, t]);
 
   const handleTouchStart = useCallback((e: TouchEvent<HTMLDivElement>) => {
     if (disabled || loading) return;
@@ -72,13 +79,18 @@ export function ImageUpload({ onImageSelect, loading = false, disabled = false }
       if (file.type.startsWith('image/')) {
         const imageUrl = URL.createObjectURL(file);
         onImageSelect(file, imageUrl);
+      } else {
+        onError?.({
+          message: t('error_invalid_image_type', 'Invalid file type. Please upload an image.'),
+          code: 'INVALID_FILE_TYPE'
+        });
       }
     }
     // Reset input value to allow selecting the same file again
     if (e.target) {
       e.target.value = '';
     }
-  }, [onImageSelect]);
+  }, [onImageSelect, onError, t]);
 
   const handleClick = useCallback(() => {
     if (!disabled && !loading) {
