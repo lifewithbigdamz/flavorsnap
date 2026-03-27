@@ -15,12 +15,9 @@ from security_config import (
     validate_json_input, is_safe_url
 )
 
-# Import performance monitoring
-from monitoring import MonitoringMiddleware, track_inference, update_model_accuracy
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Import and configure structured logging
+from logger_config import setup_logger
+logger = setup_logger(__name__)
 
 app = Flask(__name__)
 
