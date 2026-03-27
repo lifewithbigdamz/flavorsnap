@@ -14,13 +14,37 @@ from datetime import datetime, timedelta
 class SecurityConfig:
     """Security configuration class"""
     
-    # Rate limiting configurations
+    # Rate limiting configurations with tier-based access
     RATE_LIMITS = {
-        'default': '100 per minute',
-        'predict': '100 per minute',
+        # Default limits for unauthenticated requests
+        'default': '20 per minute',
         'health': '1000 per hour',
-        'api_info': '60 per minute',
-        'upload': '50 per minute'
+        'api_info': '30 per minute',
+        
+        # Free tier limits (authenticated)
+        'free_predict': '10 per minute',
+        'free_upload': '5 per minute',
+        'free_admin': '5 per minute',
+        'free_dashboard': '20 per minute',
+        
+        # Premium tier limits (authenticated)
+        'premium_predict': '100 per minute',
+        'premium_upload': '50 per minute',
+        'premium_admin': '20 per minute',
+        'premium_dashboard': '100 per minute',
+        
+        # Enterprise tier limits (authenticated)
+        'enterprise_predict': '500 per minute',
+        'enterprise_upload': '200 per minute',
+        'enterprise_admin': '100 per minute',
+        'enterprise_dashboard': '500 per minute'
+    }
+    
+    # API key tiers and their prefixes
+    API_KEY_TIERS = {
+        'free': {'prefix': 'free_', 'weight': 1},
+        'premium': {'prefix': 'prem_', 'weight': 5},
+        'enterprise': {'prefix': 'ent_', 'weight': 10}
     }
     
     # File upload security
@@ -134,10 +158,31 @@ class APIKeyManager:
     """API key management utilities"""
     
     @staticmethod
-    def generate_api_key() -> str:
-        """Generate a secure API key"""
+    def generate_api_key(tier: str = 'free') -> str:
+        """Generate a secure API key with tier prefix"""
         import secrets
-        return secrets.token_urlsafe(32)
+        
+        if tier not in SecurityConfig.API_KEY_TIERS:
+            tier = 'free'
+        
+        prefix = SecurityConfig.API_KEY_TIERS[tier]['prefix']
+        random_part = secrets.token_urlsafe(24)  # 32 chars total with prefix
+        return f"{prefix}{random_part}"
+    
+    @staticmethod
+    def generate_tiered_api_key(tier: str = 'free') -> dict:
+        """Generate API key with tier information"""
+        api_key = APIKeyManager.generate_api_key(tier)
+        return {
+            'api_key': api_key,
+            'tier': tier,
+            'limits': {
+                'predict': SecurityConfig.RATE_LIMITS[f'{tier}_predict'],
+                'upload': SecurityConfig.RATE_LIMITS[f'{tier}_upload'],
+                'admin': SecurityConfig.RATE_LIMITS[f'{tier}_admin'],
+                'dashboard': SecurityConfig.RATE_LIMITS[f'{tier}_dashboard']
+            }
+        }
     
     @staticmethod
     def hash_api_key(api_key: str) -> str:
@@ -153,7 +198,7 @@ class APIKeyManager:
         )
 
 class RateLimitManager:
-    """Rate limiting utilities"""
+    """Rate limiting utilities with tier-based access"""
     
     @staticmethod
     def get_client_ip() -> str:
@@ -172,6 +217,47 @@ class RateLimitManager:
         ip = RateLimitManager.get_client_ip()
         endpoint = endpoint or request.endpoint or 'unknown'
         return f"rate_limit:{endpoint}:{ip}"
+    
+    @staticmethod
+    def get_api_key_tier(api_key: str) -> str:
+        """Determine API key tier from key format"""
+        if not api_key:
+            return 'default'
+        
+        for tier, config in SecurityConfig.API_KEY_TIERS.items():
+            if api_key.startswith(config['prefix']):
+                return tier
+        
+        # Default to free tier for unrecognized keys
+        return 'free'
+    
+    @staticmethod
+    def get_rate_limit_for_endpoint(endpoint: str, api_key: str = None) -> str:
+        """Get appropriate rate limit for endpoint based on API key tier"""
+        tier = RateLimitManager.get_api_key_tier(api_key)
+        
+        # Map endpoints to rate limit keys
+        endpoint_mapping = {
+            'predict': f'{tier}_predict',
+            'upload': f'{tier}_upload', 
+            'generate_api_key': f'{tier}_admin',
+            'performance_dashboard': f'{tier}_dashboard',
+            'api_info': 'api_info',
+            'health_check': 'health'
+        }
+        
+        rate_limit_key = endpoint_mapping.get(endpoint, 'default')
+        return SecurityConfig.RATE_LIMITS.get(rate_limit_key, SecurityConfig.RATE_LIMITS['default'])
+    
+    @staticmethod
+    def get_tiered_key_func():
+        """Key function that considers both IP and API tier"""
+        def tiered_key():
+            api_key = request.headers.get('X-API-Key')
+            tier = RateLimitManager.get_api_key_tier(api_key)
+            ip = RateLimitManager.get_client_ip()
+            return f"{tier}:{ip}"
+        return tiered_key
 
 class SecurityMiddleware:
     """Security middleware for Flask application"""

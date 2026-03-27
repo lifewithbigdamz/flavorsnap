@@ -43,11 +43,11 @@ security_monitor = SecurityMonitor(app)
 # Initialize performance monitoring middleware
 monitoring_middleware = MonitoringMiddleware(app)
 
-# Initialize rate limiter
+# Initialize rate limiter with tiered key function
 limiter = Limiter(
-    key_func=RateLimitManager.get_client_ip,
+    key_func=RateLimitManager.get_tiered_key_func(),
     app=app,
-    default_limits=["100 per hour"]
+    default_limits=["20 per minute"]
 )
 
 # CORS Configuration
@@ -57,6 +57,20 @@ CORS(app,
      allow_headers=['Content-Type', 'Authorization', 'X-API-Key'],
      supports_credentials=True)
 
+# Dynamic rate limiting decorator
+def tiered_rate_limit(endpoint_name: str):
+    """Dynamic rate limiting based on API key tier"""
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            api_key = request.headers.get('X-API-Key')
+            rate_limit = RateLimitManager.get_rate_limit_for_endpoint(endpoint_name, api_key)
+            
+            # Apply rate limit using flask-limiter
+            with limiter.limit(rate_limit):
+                return f(*args, **kwargs)
+        return decorated_function
+    return decorator
 # API Key Authentication
 def require_api_key(f):
     @wraps(f)
@@ -84,7 +98,7 @@ def require_api_key(f):
 
 # Rate Limiting for Specific Endpoints
 @app.route('/predict', methods=['POST'])
-@limiter.limit("10 per minute")
+@tiered_rate_limit('predict')
 @require_api_key
 @track_inference
 def predict():
@@ -167,7 +181,7 @@ def health_check():
 
 # API info endpoint
 @app.route('/api/info', methods=['GET'])
-@limiter.limit("20 per minute")
+@limiter.limit("30 per minute")
 def api_info():
     return jsonify({
         'name': 'FlavorSnap API',
@@ -202,24 +216,34 @@ def api_info():
 
 # API key generation endpoint (admin only)
 @app.route('/admin/api-key/generate', methods=['POST'])
-@limiter.limit("10 per minute")
+@tiered_rate_limit('generate_api_key')
 def generate_api_key():
-    """Generate new API key (admin endpoint)"""
+    """Generate new API key with tier support (admin endpoint)"""
     if app.config.get('ENV') == 'production':
         # Add admin authentication here
         pass
     
-    new_key = APIKeyManager.generate_api_key()
-    logger.info("New API key generated")
+    # Get tier from request, default to free
+    request_data = request.get_json(silent=True) or {}
+    tier = request_data.get('tier', 'free')
+    
+    if tier not in ['free', 'premium', 'enterprise']:
+        return jsonify({'error': 'Invalid tier. Must be free, premium, or enterprise'}), 400
+    
+    # Generate tiered API key
+    key_info = APIKeyManager.generate_tiered_api_key(tier)
+    logger.info(f"New {tier} API key generated")
     
     return jsonify({
-        'api_key': new_key,
+        'api_key': key_info['api_key'],
+        'tier': key_info['tier'],
+        'limits': key_info['limits'],
         'message': 'Store this key securely - it will not be shown again'
     })
 
 # Performance dashboard endpoint
 @app.route('/dashboard', methods=['GET'])
-@limiter.limit("20 per minute")
+@tiered_rate_limit('performance_dashboard')
 def performance_dashboard():
     """Serve performance dashboard"""
     try:
@@ -236,11 +260,20 @@ def performance_dashboard():
 # Error handlers
 @app.errorhandler(429)
 def ratelimit_handler(e):
+    api_key = request.headers.get('X-API-Key')
+    tier = RateLimitManager.get_api_key_tier(api_key)
+    endpoint = request.endpoint or 'unknown'
+    
+    # Get the specific rate limit for this endpoint and tier
+    rate_limit = RateLimitManager.get_rate_limit_for_endpoint(endpoint, api_key)
+    
     return jsonify({
         'error': 'Rate limit exceeded',
         'message': str(e.description),
         'retry_after': getattr(e, 'retry_after', 60),
-        'limit': '100 per hour'
+        'limit': rate_limit,
+        'tier': tier,
+        'endpoint': endpoint
     }), 429
 
 @app.errorhandler(404)
