@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { api } from "@/utils/api";
 import { storage } from "@/utils/storage";
+import { pwaManager } from "@/lib/pwa-utils";
 import { ErrorMessage } from "@/components/ErrorMessage";
 import { useTranslation } from "next-i18next";
 import { serverSideTranslations } from "next-i18next/serverSideTranslations";
@@ -100,6 +101,17 @@ export default function Classify() {
         };
         
         setHistory(prev => [newEntry, ...prev].slice(0, MAX_HISTORY_ITEMS));
+        
+        // Cache for offline access
+        pwaManager.cacheClassification({
+          id: newEntry.id,
+          timestamp: newEntry.timestamp,
+          food: result.food,
+          confidence: result.confidence,
+          calories: result.calories,
+          imageUrl: image || undefined,
+          cachedAt: new Date().toISOString()
+        });
       }
     } catch (err: any) {
       setError({
