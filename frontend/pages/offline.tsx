@@ -1,7 +1,24 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import Head from 'next/head';
+import { pwaManager, ClassificationCache } from '@/lib/pwa-utils';
 
 export default function Offline() {
+  const [cachedClassifications, setCachedClassifications] = useState<ClassificationCache[]>([]);
+
+  useEffect(() => {
+    // Load cached classifications
+    const cached = pwaManager.getCachedClassifications();
+    setCachedClassifications(cached);
+  }, []);
+
+  const handleRetry = async () => {
+    const isOnline = await pwaManager.isOnline();
+    if (isOnline) {
+      window.location.reload();
+    } else {
+      alert('Still offline. Please check your internet connection.');
+    }
+  };
   return (
     <>
       <Head>
@@ -32,11 +49,28 @@ export default function Offline() {
                 <li>• Previously viewed food images</li>
                 <li>• Cached nutrition data</li>
                 <li>• App settings and preferences</li>
+                {cachedClassifications.length > 0 && (
+                  <li>• {cachedClassifications.length} cached classification{cachedClassifications.length !== 1 ? 's' : ''}</li>
+                )}
               </ul>
             </div>
             
+            {cachedClassifications.length > 0 && (
+              <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+                <h3 className="font-semibold text-blue-800 mb-2">Recent Classifications:</h3>
+                <div className="text-left space-y-2 max-h-40 overflow-y-auto">
+                  {cachedClassifications.slice(0, 5).map((item, index) => (
+                    <div key={index} className="flex justify-between items-center text-sm">
+                      <span className="font-medium text-blue-900">{item.food}</span>
+                      <span className="text-blue-600">{(item.confidence * 100).toFixed(0)}%</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            
             <button 
-              onClick={() => window.location.reload()}
+              onClick={handleRetry}
               className="w-full bg-amber-600 text-white py-3 px-4 rounded-lg hover:bg-amber-700 transition duration-200 font-medium"
             >
               Try Again

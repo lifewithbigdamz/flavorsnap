@@ -15,9 +15,16 @@ from security_config import (
     validate_json_input, is_safe_url
 )
 
+# Import image optimization module
+from image_optimizer import get_image_optimizer, ImageFormat
+
 # Import and configure structured logging
 from logger_config import setup_logger
 logger = setup_logger(__name__)
+
+# Import caching and model inference modules
+from cache_manager import cache_manager
+from model_inference import model_inference
 
 app = Flask(__name__)
 
@@ -27,13 +34,16 @@ class Config:
     REDIS_URL = os.environ.get('REDIS_URL', '')
     API_KEYS = os.environ.get('API_KEYS', '').split(',') if os.environ.get('API_KEYS') else []
     UPLOAD_FOLDER = 'uploads'
+    OPTIMIZED_FOLDER = 'uploads/optimized'
     MAX_CONTENT_LENGTH = SecurityConfig.MAX_CONTENT_LENGTH
     ENV = os.environ.get('FLASK_ENV', 'development')
     MAX_CONTENT_LENGTH = 10 * 1024 * 1024  # 10MB limit
 
 
+
 app.config.from_object(Config)
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs(app.config['OPTIMIZED_FOLDER'], exist_ok=True)
 
 # Security middleware
 security_middleware = SecurityMiddleware(app)
@@ -41,6 +51,15 @@ security_monitor = SecurityMonitor(app)
 
 # Initialize performance monitoring middleware
 monitoring_middleware = MonitoringMiddleware(app)
+
+# Initialize model registry and validator
+try:
+    model_registry = ModelRegistry()
+    model_validator = ModelValidator(model_registry)
+    logger.info("Model validator initialized successfully")
+except Exception as e:
+    logger.warning(f"Model validator initialization failed: {e}")
+    model_validator = None
 
 # Initialize rate limiter with tiered key function
 limiter = Limiter(
@@ -55,6 +74,21 @@ CORS(app,
      allow_headers=['Content-Type', 'Authorization', 'X-API-Key'],
      supports_credentials=True)
 
+# Dynamic rate limiting decorator
+def tiered_rate_limit(endpoint_name: str):
+    """Dynamic rate limiting based on API key tier"""
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            api_key = request.headers.get('X-API-Key')
+            rate_limit = RateLimitManager.get_rate_limit_for_endpoint(endpoint_name, api_key)
+            
+            # Apply rate limit using flask-limiter
+            with limiter.limit(rate_limit):
+                return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+# API Key Authentication
 
 def require_api_key(f):
     @wraps(f)
@@ -78,9 +112,117 @@ def require_api_key(f):
 @app.route('/predict', methods=['POST'])
 @tiered_rate_limit('predict')
 @require_api_key
-@track_inference
 def predict():
-    """Food classification endpoint"""
+    """Food classification endpoint with intelligent caching"""
+    start_time = time.time()
+    request_id = request.headers.get('X-Request-ID', f'req_{int(time.time() * 1000)}')
+
+    try:
+        # Validate and sanitize JSON input if present
+        if request.is_json:
+            json_data = request.get_json()
+            is_valid, error_msg = validate_json_input(json_data)
+            if not is_valid:
+                logger.warning(f"JSON validation failed: {error_msg}")
+                return jsonify({'error': error_msg}), 400
+
+        # Validate file upload
+        if 'image' not in request.files:
+            return jsonify({'error': 'No image provided'}), 400
+
+        file = request.files['image']
+
+        # Sanitize filename from form data
+        if file.filename:
+            file.filename = InputValidator.sanitize_filename(file.filename)
+
+        is_valid, error_msg = InputValidator.validate_file_upload(file)
+        if not is_valid:
+            logger.warning(f"File validation failed: {error_msg}")
+            return jsonify({'error': error_msg}), 400
+
+        # Read file data for hashing
+        file.seek(0)
+        image_data = file.read()
+        file.seek(0)  # Reset file pointer
+
+        # Compute image hash for caching
+        image_hash = cache_manager.compute_image_hash(image_data)
+
+        # Check cache first
+        cached_result = cache_manager.get_cached_prediction(image_hash)
+        if cached_result:
+            cached_result['cached'] = True
+            cached_result['request_id'] = request_id
+            logger.info(f"Cache hit for request {request_id}, saved inference time")
+            return jsonify(cached_result)
+
+        # Cache miss - proceed with inference
+        filename = InputValidator.secure_filename_custom(file.filename)
+        save_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        with open(save_path, 'wb') as f:
+            f.write(image_data)
+
+        # Run model inference
+        prediction_result = model_inference.predict(save_path)
+
+        if 'error' in prediction_result:
+            return jsonify({
+                'error': prediction_result['error'],
+                'request_id': request_id,
+                'processing_time': prediction_result.get('processing_time', 0)
+            }), 500
+
+        # Prepare response
+        response_data = {
+            'predictions': prediction_result['predictions'],
+            'top_prediction': prediction_result['top_prediction'],
+            'confidence': prediction_result['top_prediction']['confidence'] if prediction_result['top_prediction'] else 0,
+            'prediction': prediction_result['top_prediction']['class'] if prediction_result['top_prediction'] else 'unknown',
+            'processing_time': prediction_result['processing_time'],
+            'timestamp': datetime.now().isoformat(),
+            'request_id': request_id,
+            'cached': False,
+            'model_version': prediction_result.get('model_version', 'v1.0'),
+            'image_hash': image_hash[:16]  # First 16 chars for debugging
+        }
+
+        # Cache the result
+        cache_success = cache_manager.cache_prediction(
+            image_hash=image_hash,
+            prediction_data=response_data,
+            model_version=prediction_result.get('model_version', 'v1.0')
+        )
+
+        if cache_success:
+            logger.info(f"Cached prediction for image hash: {image_hash[:8]}...")
+        else:
+            logger.warning(f"Failed to cache prediction for image hash: {image_hash[:8]}...")
+
+        # Clean up uploaded file
+        try:
+            os.remove(save_path)
+        except Exception as e:
+            logger.warning(f"Failed to clean up file {save_path}: {e}")
+
+        logger.info(f"Prediction completed for request {request_id} in {prediction_result['processing_time']:.3f}s")
+        return jsonify(response_data)
+
+    except Exception as e:
+        logger.error(f"Prediction error for request {request_id}: {str(e)}", exc_info=True)
+        processing_time = time.time() - start_time
+        return jsonify({
+            'error': 'Internal server error',
+            'request_id': request_id,
+            'processing_time': round(processing_time, 3)
+        }), 500
+
+
+@app.route('/optimize', methods=['POST'])
+@tiered_rate_limit('optimize')
+@require_api_key
+def optimize_image():
+    """Endpoint for image optimization only (returns optimized images and metadata)"""
     start_time = time.time()
     try:
         if 'image' not in request.files:
@@ -92,24 +234,114 @@ def predict():
             logger.warning(f"File validation failed: {error_msg}")
             return jsonify({'error': error_msg}), 400
 
-        filename = InputValidator.secure_filename_custom(file.filename)
-        save_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(save_path)
+        # Get optimization parameters from request
+        quality = request.form.get('quality', 'high')
+        generate_webp = request.form.get('generate_webp', 'true').lower() == 'true'
+        generate_thumbnails = request.form.get('generate_thumbnails', 'true').lower() == 'true'
+        max_width = int(request.form.get('max_width', 1920))
+        max_height = int(request.form.get('max_height', 1080))
 
-        # TODO: replace with actual model inference
+        # Optimize image
+        optimizer = get_image_optimizer()
+        optimization_result = optimizer.optimize_image(
+            file.stream,
+            quality=quality,
+            generate_webp=generate_webp,
+            generate_thumbnails=generate_thumbnails,
+            max_width=max_width,
+            max_height=max_height
+        )
+
+        # Save optimized images
+        base_filename = InputValidator.secure_filename_custom(file.filename)
+        base_filename = os.path.splitext(base_filename)[0]
+        saved_paths = optimizer.save_optimized_images(
+            optimization_result,
+            app.config['OPTIMIZED_FOLDER'],
+            base_filename
+        )
+
         processing_time = time.time() - start_time
-        logger.info(f"Prediction completed for {filename} in {processing_time:.3f}s")
+        logger.info(f"Image optimization endpoint: {optimization_result['metadata']['compression_ratio']}% "
+                   f"compression in {processing_time:.3f}s")
+
+        # Sanitize request ID from headers
+        request_id = InputValidator.sanitize_string(
+            request.headers.get('X-Request-ID', 'unknown'),
+            max_length=64
+        )
 
         return jsonify({
-            'prediction': 'Sample food',
-            'confidence': 0.95,
-            'processing_time': processing_time,
-            'timestamp': datetime.now().isoformat(),
-            'request_id': request.headers.get('X-Request-ID', 'unknown')
-        })
+            'status': 'success',
+            'metadata': optimization_result['metadata'],
+            'saved_paths': saved_paths,
+            'sizes': {
+                'original': optimization_result['original']['size'],
+                'optimized': optimization_result['optimized']['size'],
+                'jpeg_fallback': optimization_result['jpeg_fallback']['size'],
+                'thumbnails': {
+                    name: data['size']
+                    for name, data in optimization_result.get('thumbnails', {}).items()
+                }
+            },
+            'processing_time': processing_time
+        }), 200
+
+    except ValueError as ve:
+        logger.warning(f"Image validation error: {str(ve)}")
+        return jsonify({'error': str(ve)}), 400
+    except Exception as e:
+        logger.error(f"Image optimization error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+@app.route('/optimized/<path:filename>', methods=['GET'])
+@limiter.limit("100 per minute")
+def serve_optimized_image(filename: str):
+    """Serve optimized images with proper caching headers"""
+    try:
+        from flask import send_file
+        
+        # Validate filename to prevent directory traversal
+        if not InputValidator.validate_filename(filename):
+            logger.warning(f"Invalid filename requested: {filename}")
+            return jsonify({'error': 'Invalid filename'}), 400
+
+        file_path = os.path.join(app.config['OPTIMIZED_FOLDER'], filename)
+        
+        # Security check: ensure file is within optimized folder
+        if not os.path.abspath(file_path).startswith(os.path.abspath(app.config['OPTIMIZED_FOLDER'])):
+            logger.warning(f"Attempted directory traversal: {filename}")
+            return jsonify({'error': 'Access denied'}), 403
+
+        if not os.path.exists(file_path):
+            return jsonify({'error': 'Image not found'}), 404
+
+        # Determine MIME type
+        if filename.endswith('.webp'):
+            mime_type = 'image/webp'
+        elif filename.endswith('.jpg') or filename.endswith('.jpeg'):
+            mime_type = 'image/jpeg'
+        elif filename.endswith('.png'):
+            mime_type = 'image/png'
+        else:
+            mime_type = 'application/octet-stream'
+
+        # Set aggressive caching headers for optimized images
+        response = send_file(
+            file_path,
+            mimetype=mime_type,
+            cache_timeout=31536000  # 1 year
+        )
+        
+        # Add custom headers for better caching and security
+        response.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
+        response.headers['ETag'] = InputValidator.secure_filename_custom(filename)
+        
+        return response
 
     except Exception as e:
-        logger.error(f"Prediction error: {str(e)}", exc_info=True)
+        logger.error(f"Error serving optimized image: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
 
 
@@ -127,42 +359,13 @@ def health_check():
                 'timestamp': datetime.now().isoformat(),
                 'monitoring': 'basic'
             }
-        
-        # Perform quick dependency checks
-        overall_status = 'healthy'
-        checks = {}
-        
-        # Check model file
-        model_exists = os.path.exists('model.pth')
-        checks['model'] = 'available' if model_exists else 'missing'
-        if not model_exists:
-            overall_status = 'degraded'
-        
-        # Check database connectivity
-        try:
-            import sqlite3
-            conn = sqlite3.connect('predictions.db', timeout=2)
-            conn.close()
-            checks['database'] = 'connected'
-        except Exception:
-            checks['database'] = 'disconnected'
-            overall_status = 'degraded'
-        
-        # Check Redis if configured
-        if os.environ.get('REDIS_URL'):
-            try:
-                import redis
-                r = redis.from_url(os.environ.get('REDIS_URL'), socket_timeout=2)
-                r.ping()
-                checks['redis'] = 'connected'
-            except Exception:
-                checks['redis'] = 'disconnected'
-                overall_status = 'degraded'
-        
-        # Update health check status metric
-        if hasattr(monitoring_middleware, 'HEALTH_CHECK_STATUS'):
-            monitoring_middleware.HEALTH_CHECK_STATUS.set(1 if overall_status == 'healthy' else 0)
-        
+
+        # Get cache stats
+        cache_stats = cache_manager.get_cache_stats()
+
+        # Get model info
+        model_info = model_inference.get_model_info()
+
         return jsonify({
             'status': overall_status,
             'timestamp': datetime.now().isoformat(),
@@ -188,6 +391,13 @@ def health_check():
                 'metrics_endpoint': '/metrics',
                 'dashboard_endpoint': '/dashboard'
             },
+            'cache': cache_stats,
+            'model': {
+                'loaded': model_info['model_type'] != 'dummy',
+                'type': model_info['model_type'],
+                'classes': len(model_info['classes']),
+                'device': model_info['device']
+            },
             'detailed_metrics': detailed_health
         })
     except Exception as e:
@@ -201,6 +411,45 @@ def health_check():
         }), 500
 
 
+@app.route('/cache/stats', methods=['GET'])
+@limiter.limit("10 per minute")
+@require_api_key
+def cache_stats():
+    """Get cache performance statistics"""
+    try:
+        stats = cache_manager.get_cache_stats()
+        return jsonify({
+            'cache_stats': stats,
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        logger.error(f"Cache stats error: {e}")
+        return jsonify({'error': 'Failed to get cache stats'}), 500
+
+
+@app.route('/cache/invalidate', methods=['POST'])
+@limiter.limit("5 per minute")
+@require_api_key
+def invalidate_cache():
+    """Invalidate cache entries"""
+    try:
+        data = request.get_json() or {}
+        image_hash = data.get('image_hash')
+        model_version = data.get('model_version', 'v1')
+
+        invalidated_count = cache_manager.invalidate_cache(image_hash, model_version)
+
+        return jsonify({
+            'message': f'Invalidated {invalidated_count} cache entries',
+            'image_hash': image_hash,
+            'model_version': model_version,
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        logger.error(f"Cache invalidation error: {e}")
+        return jsonify({'error': 'Failed to invalidate cache'}), 500
+
+
 @app.route('/api/info', methods=['GET'])
 @limiter.limit("30 per minute")
 def api_info():
@@ -208,8 +457,8 @@ def api_info():
         'name': 'FlavorSnap API',
         'version': '2.0.0',
         'endpoints': {
-            'predict': 'POST /predict - Food classification',
-            'health': 'GET /health - Basic health check',
+            'predict': 'POST /predict - Food classification with caching',
+            'health': 'GET /health - Health check with cache stats',
             'health_detailed': 'GET /health/detailed - Detailed health metrics',
             'health_database': 'GET /health/database - Database connectivity check',
             'health_redis': 'GET /health/redis - Redis connectivity check',
@@ -219,28 +468,16 @@ def api_info():
             'metrics': 'GET /metrics - Prometheus metrics',
             'dashboard': 'GET /dashboard - Performance dashboard',
             'info': 'GET /api/info - API information',
+            'cache_stats': 'GET /cache/stats - Cache performance statistics',
+            'cache_invalidate': 'POST /cache/invalidate - Invalidate cache entries',
             'admin_api_key': 'POST /admin/api-key/generate - Generate API key'
         },
-        'health_checks': {
-            'basic': {
-                'endpoint': '/health',
-                'description': 'Overall system health status',
-                'response_time': '< 100ms',
-                'includes': ['model_status', 'database_connectivity', 'redis_status']
-            },
-            'detailed': {
-                'endpoint': '/health/detailed',
-                'description': 'Comprehensive system metrics',
-                'response_time': '< 500ms',
-                'includes': ['system_resources', 'gpu_status', 'model_metrics']
-            },
-            'specialized': {
-                'database': '/health/database - Database performance and connectivity',
-                'redis': '/health/redis - Redis connection and metrics',
-                'model': '/health/model - ML model loading and inference metrics',
-                'system': '/health/system - CPU, memory, disk, network metrics',
-                'dependencies': '/health/dependencies - Package versions and environment'
-            }
+        'caching': {
+            'enabled': True,
+            'type': 'Redis with in-memory fallback',
+            'ttl_seconds': 3600,
+            'hash_based_deduplication': True,
+            'stats_tracking': True
         },
         'security': {
             'rate_limiting': 'enabled',
@@ -266,6 +503,22 @@ def api_info():
 @app.route('/admin/api-key/generate', methods=['POST'])
 @tiered_rate_limit('generate_api_key')
 def generate_api_key():
+    """Generate new API key with tier support (admin endpoint)"""
+    if app.config.get('ENV') == 'production':
+        # Add admin authentication here
+        pass
+    
+    # Get tier from request, default to free
+    request_data = request.get_json(silent=True) or {}
+    tier = request_data.get('tier', 'free')
+    
+    if tier not in ['free', 'premium', 'enterprise']:
+        return jsonify({'error': 'Invalid tier. Must be free, premium, or enterprise'}), 400
+    
+    # Generate tiered API key
+    key_info = APIKeyManager.generate_tiered_api_key(tier)
+    logger.info(f"New {tier} API key generated")
+    
     new_key = APIKeyManager.generate_api_key()
     logger.info("New API key generated")
     return jsonify({

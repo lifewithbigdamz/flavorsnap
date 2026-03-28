@@ -11,6 +11,8 @@ import io
 
 class SecurityConfig:
     """Security configuration class"""
+    
+    # Rate limiting configurations with tier-based access
 
     RATE_LIMITS = {
         # Default limits for unauthenticated requests
@@ -52,6 +54,17 @@ class SecurityConfig:
         'image/png',
         'image/webp'
     }
+    # Malicious file signatures
+    MALICIOUS_SIGNATURES = {
+        b'\x4D\x5A',  # PE executable
+        b'\x7FELF',   # ELF executable
+        b'\xCA\xFE\xBA\xBE',  # Java class
+        b'\xD0\xCF\x11\xE0',  # Microsoft Office
+        b'PK\x03\x04',  # ZIP (could contain malicious content)
+    }
+    # Image validation thresholds
+    MAX_IMAGE_DIMENSION = 8192
+    MIN_IMAGE_DIMENSION = 32
     
     # Image dimension constraints
     MIN_IMAGE_WIDTH = 100
@@ -81,12 +94,128 @@ class InputValidator:
     """Input validation and sanitization utilities"""
 
     @staticmethod
-    def sanitize_string(text: str, max_length: int = 1000) -> str:
-        if not text:
+    def sanitize_string(text: str, max_length: int = 1000, allow_html: bool = False) -> str:
+        """Sanitize string input with comprehensive XSS protection"""
+        if not text or not isinstance(text, str):
             return ""
-        # Strip HTML tags with a simple regex (avoids bleach dependency)
-        cleaned = re.sub(r'<[^>]+>', '', text)
-        return cleaned[:max_length].strip()
+
+        # Remove null bytes and control characters
+        text = text.replace('\x00', '').replace('\r', '').replace('\n', ' ')
+
+        # Strip HTML tags if not allowed (basic XSS protection)
+        if not allow_html:
+            # More comprehensive HTML tag removal
+            text = re.sub(r'<[^>]+>', '', text)
+            # Remove script tags and their content
+            text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.IGNORECASE | re.DOTALL)
+            # Remove javascript: and other dangerous protocols
+            text = re.sub(r'(javascript|vbscript|data|file):', '', text, flags=re.IGNORECASE)
+
+        # Remove potential SQL injection patterns
+        text = re.sub(r'(\b(union|select|insert|update|delete|drop|create|alter|exec|execute)\b)', '', text, flags=re.IGNORECASE)
+
+        # Remove command injection patterns
+        text = re.sub(r'[;&|`$()<>]', '', text)
+
+        # Limit length
+        return text[:max_length].strip()
+
+    @staticmethod
+    def sanitize_json_input(data: Dict[str, Any], schema: Dict[str, Any] = None) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+        """Sanitize JSON input data with schema validation"""
+        if not isinstance(data, dict):
+            return False, "Invalid JSON format", {}
+
+        sanitized_data = {}
+
+        for key, value in data.items():
+            # Sanitize keys
+            clean_key = InputValidator.sanitize_string(str(key), max_length=100, allow_html=False)
+            if not clean_key:
+                continue
+
+            # Sanitize values based on type
+            if isinstance(value, str):
+                sanitized_data[clean_key] = InputValidator.sanitize_string(value, max_length=1000)
+            elif isinstance(value, (int, float)):
+                # Ensure numeric values are within reasonable bounds
+                if isinstance(value, int) and (-1000000 <= value <= 1000000):
+                    sanitized_data[clean_key] = value
+                elif isinstance(value, float) and (-1000000 <= value <= 1000000):
+                    sanitized_data[clean_key] = value
+            elif isinstance(value, bool):
+                sanitized_data[clean_key] = value
+            elif isinstance(value, list):
+                # Sanitize list items (limit to 100 items)
+                sanitized_list = []
+                for item in value[:100]:
+                    if isinstance(item, str):
+                        sanitized_list.append(InputValidator.sanitize_string(item, max_length=500))
+                    elif isinstance(item, (int, float, bool)):
+                        sanitized_list.append(item)
+                sanitized_data[clean_key] = sanitized_list
+            # Skip other types (dict, None, etc.) for security
+
+        # Schema validation if provided
+        if schema:
+            for required_field in schema.get('required', []):
+                if required_field not in sanitized_data:
+                    return False, f"Missing required field: {required_field}", sanitized_data
+
+            for field, field_schema in schema.get('properties', {}).items():
+                if field in sanitized_data:
+                    field_type = field_schema.get('type')
+                    if field_type == 'string' and not isinstance(sanitized_data[field], str):
+                        return False, f"Field {field} must be a string", sanitized_data
+                    elif field_type == 'number' and not isinstance(sanitized_data[field], (int, float)):
+                        return False, f"Field {field} must be a number", sanitized_data
+                    elif field_type == 'boolean' and not isinstance(sanitized_data[field], bool):
+                        return False, f"Field {field} must be a boolean", sanitized_data
+
+        return True, None, sanitized_data
+
+    @staticmethod
+    def sanitize_url(url: str) -> str:
+        """Sanitize URL input"""
+        if not url or not isinstance(url, str):
+            return ""
+
+        # Remove dangerous protocols
+        url = re.sub(r'(javascript|vbscript|data|file):', '', url, flags=re.IGNORECASE)
+
+        # Basic URL validation
+        if not re.match(r'^https?://', url):
+            return ""
+
+        # Limit length
+        return url[:2000]
+
+    @staticmethod
+    def sanitize_email(email: str) -> str:
+        """Sanitize email input"""
+        if not email or not isinstance(email, str):
+            return ""
+
+        # Basic email pattern validation
+        if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
+            return ""
+
+        return email[:254].lower()  # RFC 5321 limit
+
+    @staticmethod
+    def sanitize_filename(filename: str) -> str:
+        """Sanitize filename input"""
+        if not filename or not isinstance(filename, str):
+            return ""
+
+        # Remove path traversal attempts
+        filename = os.path.basename(filename)
+
+        # Remove dangerous characters
+        filename = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', filename)
+
+        # Limit length
+        return filename[:255]
 
     @staticmethod
     def validate_filename(filename: str) -> bool:
@@ -176,6 +305,70 @@ class InputValidator:
         return True, None
 
     @staticmethod
+    def _check_malicious_signatures(file_content: bytes) -> Tuple[bool, str]:
+        """Check for malicious file signatures"""
+        # Check file header for known malicious signatures
+        for signature, description in {
+            b'\x4D\x5A': 'PE executable',
+            b'\x7FELF': 'ELF executable', 
+            b'\xCA\xFE\xBA\xBE': 'Java class',
+            b'\xD0\xCF\x11\xE0': 'Microsoft Office',
+            b'PK\x03\x04': 'ZIP archive'
+        }.items():
+            if file_content.startswith(signature):
+                return True, description
+        
+        # Check for script content in image files
+        text_content = file_content.decode('utf-8', errors='ignore').lower()
+        script_patterns = [
+            '<script', 'javascript:', 'vbscript:', 
+            'onload=', 'onerror=', 'onclick=',
+            'eval(', 'document.', 'window.',
+            'php://', 'data://', 'file://'
+        ]
+        
+        for pattern in script_patterns:
+            if pattern in text_content:
+                return True, f'Script content detected: {pattern}'
+        
+        return False, ''
+    
+    @staticmethod
+    def _validate_image_content(file_content: bytes) -> Tuple[bool, str]:
+        """Validate image content using PIL"""
+        try:
+            # Open image with PIL
+            image = Image.open(io.BytesIO(file_content))
+            
+            # Verify image format
+            if image.format not in ['JPEG', 'PNG', 'GIF', 'WEBP']:
+                return False, f"Unsupported image format: {image.format}"
+            
+            # Check image dimensions
+            width, height = image.size
+            if width < SecurityConfig.MIN_IMAGE_DIMENSION or height < SecurityConfig.MIN_IMAGE_DIMENSION:
+                return False, f"Image too small: {width}x{height}"
+            
+            if width > SecurityConfig.MAX_IMAGE_DIMENSION or height > SecurityConfig.MAX_IMAGE_DIMENSION:
+                return False, f"Image too large: {width}x{height}"
+            
+            # Verify image can be loaded (detects corrupted files)
+            image.verify()
+            
+            # Re-open after verify (verify() closes the image)
+            image = Image.open(io.BytesIO(file_content))
+            
+            # Check for reasonable aspect ratio (to detect panorama attacks)
+            aspect_ratio = max(width, height) / min(width, height)
+            if aspect_ratio > 20:  # Very extreme aspect ratios
+                return False, f"Extreme aspect ratio: {aspect_ratio:.2f}"
+            
+            return True, ''
+            
+        except Exception as e:
+            return False, f"Image validation failed: {str(e)}"
+    
+    @staticmethod
     def secure_filename_custom(filename: str) -> str:
         """Custom secure filename generation with path traversal protection"""
         # Remove any path components
@@ -207,6 +400,32 @@ class APIKeyManager:
     """API key management utilities"""
 
     @staticmethod
+    def generate_api_key(tier: str = 'free') -> str:
+        """Generate a secure API key with tier prefix"""
+        import secrets
+        
+        if tier not in SecurityConfig.API_KEY_TIERS:
+            tier = 'free'
+        
+        prefix = SecurityConfig.API_KEY_TIERS[tier]['prefix']
+        random_part = secrets.token_urlsafe(24)  # 32 chars total with prefix
+        return f"{prefix}{random_part}"
+    
+    @staticmethod
+    def generate_tiered_api_key(tier: str = 'free') -> dict:
+        """Generate API key with tier information"""
+        api_key = APIKeyManager.generate_api_key(tier)
+        return {
+            'api_key': api_key,
+            'tier': tier,
+            'limits': {
+                'predict': SecurityConfig.RATE_LIMITS[f'{tier}_predict'],
+                'upload': SecurityConfig.RATE_LIMITS[f'{tier}_upload'],
+                'admin': SecurityConfig.RATE_LIMITS[f'{tier}_admin'],
+                'dashboard': SecurityConfig.RATE_LIMITS[f'{tier}_dashboard']
+            }
+        }
+    
     def generate_api_key() -> str:
         import secrets
         return secrets.token_urlsafe(32)
@@ -224,6 +443,8 @@ class APIKeyManager:
 
 
 class RateLimitManager:
+    """Rate limiting utilities with tier-based access"""
+    
     """Rate limiting utilities"""
 
     @staticmethod
@@ -356,11 +577,17 @@ def is_safe_url(url: str) -> bool:
     return True
 
 
-def validate_json_input(data: Dict[str, Any], required_fields: list = None) -> Tuple[bool, Optional[str]]:
-    if not isinstance(data, dict):
-        return False, "Invalid JSON format"
+def validate_json_input(data: Dict[str, Any], required_fields: list = None, schema: Dict[str, Any] = None) -> Tuple[bool, Optional[str]]:
+    """Validate and sanitize JSON input data"""
+    is_valid, error_msg, sanitized_data = InputValidator.sanitize_json_input(data, schema)
+
+    if not is_valid:
+        return False, error_msg
+
+    # Check required fields
     if required_fields:
-        missing = [f for f in required_fields if f not in data]
+        missing = [f for f in required_fields if f not in sanitized_data]
         if missing:
             return False, f"Missing required fields: {', '.join(missing)}"
+
     return True, None

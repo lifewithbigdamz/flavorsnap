@@ -1,4 +1,4 @@
-import { useRef, useState, useCallback, DragEvent, ChangeEvent, TouchEvent } from 'react';
+import { useRef, useState, useCallback, DragEvent, ChangeEvent, TouchEvent, KeyboardEvent } from 'react';
 import { useTranslation } from 'next-i18next';
 import { AppError } from '../types';
 
@@ -7,9 +7,10 @@ interface ImageUploadProps {
   onError?: (error: AppError) => void;
   loading?: boolean;
   disabled?: boolean;
+  uploadProgress?: number; // Progress percentage (0-100)
 }
 
-export function ImageUpload({ onImageSelect, onError, loading = false, disabled = false }: ImageUploadProps) {
+export function ImageUpload({ onImageSelect, onError, loading = false, disabled = false, uploadProgress }: ImageUploadProps) {
   const { t } = useTranslation('common');
   const [isDragging, setIsDragging] = useState(false);
   const [isTouching, setIsTouching] = useState(false);
@@ -98,6 +99,27 @@ export function ImageUpload({ onImageSelect, onError, loading = false, disabled 
     }
   }, [disabled, loading]);
 
+  const handleKeyDown = useCallback((e: KeyboardEvent<HTMLDivElement>) => {
+    if (disabled || loading) return;
+    
+    // Support Enter and Space keys for activation
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      handleClick();
+    }
+    
+    // Support Escape key to blur focus
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      if (fileInputRef.current) {
+        fileInputRef.current.blur();
+      }
+      e.currentTarget.blur();
+    }
+    
+    // Allow default Tab behavior for navigation
+  }, [disabled, loading, handleClick]);
+
   return (
     <div className="w-full max-w-md mx-auto px-4 sm:px-0">
       <div
@@ -120,13 +142,14 @@ export function ImageUpload({ onImageSelect, onError, loading = false, disabled 
         onTouchEnd={handleTouchEnd}
         onClick={handleClick}
         role="button"
-        tabIndex={0}
-        aria-label={t('upload_image_area')}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            handleClick();
-          }
-        }}
+        tabIndex={disabled ? -1 : 0}
+        aria-label={t('upload_image_area', 'Image upload area')}
+        aria-describedby={uploadProgress !== undefined && uploadProgress > 0 && uploadProgress < 100 ? 'upload-progress' : undefined}
+        aria-disabled={disabled || loading}
+        aria-pressed={isDragging}
+        aria-busy={loading}
+        onKeyDown={handleKeyDown}
+        data-testid="image-upload-drop-zone"
       >
         <input
           ref={fileInputRef}
@@ -136,6 +159,7 @@ export function ImageUpload({ onImageSelect, onError, loading = false, disabled 
           className="hidden"
           disabled={disabled || loading}
           aria-label={t('select_image_file')}
+          tabIndex={-1} // Hide from tab order since parent is focusable
         />
         
         <div className="flex flex-col items-center space-y-3 sm:space-y-4">
@@ -171,15 +195,51 @@ export function ImageUpload({ onImageSelect, onError, loading = false, disabled 
         
         {/* Mobile-specific hint */}
         <div className="absolute bottom-2 left-2 right-2 sm:hidden">
-          <p className="text-xs text-gray-400 text-center">
+          <p className="text-xs text-gray-400 text-center" aria-hidden="true">
             {t('tap_to_upload')}
           </p>
         </div>
+        
+        {/* Drag overlay for screen readers */}
+        {isDragging && (
+          <div 
+            className="absolute inset-0 bg-accent/20 rounded-2xl flex items-center justify-center pointer-events-none"
+            aria-live="polite"
+            aria-atomic="true"
+          >
+            <p className="text-accent font-medium text-lg">
+              {t('drop_image_here', 'Drop image here to upload')}
+            </p>
+          </div>
+        )}
       </div>
+      
+      {/* Upload progress bar */}
+      {uploadProgress !== undefined && uploadProgress > 0 && uploadProgress < 100 && (
+        <div className="mt-3">
+          <div 
+            id="upload-progress"
+            className="h-2 bg-gray-200 rounded-full overflow-hidden"
+            role="progressbar"
+            aria-valuenow={uploadProgress}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-label={t('upload_progress', 'Upload progress: {{progress}}%', { progress: uploadProgress })}
+          >
+            <div 
+              className="h-full bg-accent transition-all duration-300 ease-out"
+              style={{ width: `${uploadProgress}%` }}
+            />
+          </div>
+          <div className="sr-only" aria-live="polite" aria-atomic="true">
+            {t('upload_progress_announcement', 'Upload progress: {{progress}}%', { progress: uploadProgress })}
+          </div>
+        </div>
+      )}
       
       {/* File type hint */}
       <div className="mt-3 text-center">
-        <p className="text-xs text-gray-400">
+        <p className="text-xs text-gray-400" role="note" aria-label={t('supported_formats_hint', 'Supported image formats: JPG, PNG, GIF, WebP, HEIC')}>
           {t('supported_formats')}: JPG, PNG, GIF, WebP, HEIC
         </p>
       </div>

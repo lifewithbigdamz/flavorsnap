@@ -1,8 +1,36 @@
 import { useRouter } from 'next/router';
 import { Camera, Upload, Zap, BarChart3 } from 'lucide-react';
+import { useEffect, useRef } from 'react';
 
 export default function Classify() {
   const router = useRouter();
+  const singleButtonRef = useRef<HTMLButtonElement>(null);
+  const batchButtonRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    // Focus management - set initial focus to first option
+    singleButtonRef.current?.focus();
+  }, []);
+
+  const handleKeyDown = (e: React.KeyboardEvent, action: () => void) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      action();
+    }
+    
+    // Arrow key navigation between options
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (document.activeElement === singleButtonRef.current) {
+        batchButtonRef.current?.focus();
+      }
+    } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (document.activeElement === batchButtonRef.current) {
+        singleButtonRef.current?.focus();
+      }
+    }
+  };
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-orange-50 to-blue-50 py-12">
@@ -43,8 +71,11 @@ export default function Classify() {
               </li>
             </ul>
             <button
+              ref={singleButtonRef}
               onClick={() => router.push('/single')}
-              className="w-full bg-blue-600 text-white py-3 rounded-lg font-semibold hover:bg-blue-700 transition"
+              onKeyDown={(e) => handleKeyDown(e, () => router.push('/single'))}
+              className="w-full bg-blue-600 text-white py-3 rounded-lg font-semibold hover:bg-blue-700 transition focus:outline-none focus:ring-4 focus:ring-blue-500/50"
+              aria-label="Classify single image - Upload and classify one image at a time"
             >
               Classify Single Image
             </button>
@@ -76,8 +107,11 @@ export default function Classify() {
               </li>
             </ul>
             <button
+              ref={batchButtonRef}
               onClick={() => router.push('/batch')}
-              className="w-full bg-green-600 text-white py-3 rounded-lg font-semibold hover:bg-green-700 transition"
+              onKeyDown={(e) => handleKeyDown(e, () => router.push('/batch'))}
+              className="w-full bg-green-600 text-white py-3 rounded-lg font-semibold hover:bg-green-700 transition focus:outline-none focus:ring-4 focus:ring-green-500/50"
+              aria-label="Start batch processing - Upload and classify multiple images simultaneously"
             >
               Start Batch Processing
             </button>
@@ -87,7 +121,9 @@ export default function Classify() {
         <div className="mt-12 text-center">
           <button
             onClick={() => router.push('/')}
-            className="text-gray-600 hover:text-gray-800"
+            onKeyDown={(e) => handleKeyDown(e, () => router.push('/'))}
+            className="text-gray-600 hover:text-gray-800 focus:outline-none focus:ring-2 focus:ring-gray-500 px-4 py-2 rounded-lg"
+            aria-label="Go back to home page"
           >
             ← Back to Home
           </button>
