@@ -26,6 +26,9 @@ logger = setup_logger(__name__)
 from cache_manager import cache_manager
 from model_inference import model_inference
 
+# Import Swagger documentation setup
+from swagger_setup import setup_swagger
+
 app = Flask(__name__)
 
 
@@ -73,6 +76,9 @@ CORS(app,
      methods=['GET', 'POST', 'PUT', 'DELETE'],
      allow_headers=['Content-Type', 'Authorization', 'X-API-Key'],
      supports_credentials=True)
+
+# Setup API documentation
+setup_swagger(app)
 
 # Dynamic rate limiting decorator
 def tiered_rate_limit(endpoint_name: str):
