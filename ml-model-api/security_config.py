@@ -2,21 +2,10 @@
 Security configuration and middleware for FlavorSnap API
 """
 import os
-import bleach
 import re
-try:
-    import magic
-    MAGIC_AVAILABLE = True
-except ImportError:
-    MAGIC_AVAILABLE = False
-    print("Warning: python-magic not available. Using fallback MIME detection.")
 import hashlib
-from typing import Dict, Any, Optional, Tuple, List
-from flask import request, abort
-from werkzeug.utils import secure_filename
 import hmac
 from datetime import datetime, timedelta
-import logging
 from PIL import Image
 import io
 
@@ -24,6 +13,7 @@ class SecurityConfig:
     """Security configuration class"""
     
     # Rate limiting configurations with tier-based access
+
     RATE_LIMITS = {
         # Default limits for unauthenticated requests
         'default': '20 per minute',
@@ -57,12 +47,11 @@ class SecurityConfig:
     }
     
     # File upload security
-    ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
-    MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16MB
+    ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'webp'}
+    MAX_CONTENT_LENGTH = 10 * 1024 * 1024  # 10MB
     ALLOWED_MIME_TYPES = {
         'image/jpeg',
-        'image/png', 
-        'image/gif',
+        'image/png',
         'image/webp'
     }
     # Malicious file signatures
@@ -77,14 +66,19 @@ class SecurityConfig:
     MAX_IMAGE_DIMENSION = 8192
     MIN_IMAGE_DIMENSION = 32
     
+    # Image dimension constraints
+    MIN_IMAGE_WIDTH = 100
+    MIN_IMAGE_HEIGHT = 100
+    MAX_IMAGE_WIDTH = 10000  # Prevent memory exhaustion
+    MAX_IMAGE_HEIGHT = 10000
+    
     # Input validation patterns
     PATTERNS = {
         'filename': re.compile(r'^[a-zA-Z0-9._-]+$'),
         'api_key': re.compile(r'^[a-zA-Z0-9]{32,}$'),
-        'request_id': re.compile(r'^[a-zA-Z0-9-_]{8,64}$')
+        'request_id': re.compile(r'^[a-zA-Z0-9\-_]{8,64}$')
     }
-    
-    # Security headers
+
     SECURITY_HEADERS = {
         'X-Content-Type-Options': 'nosniff',
         'X-Frame-Options': 'DENY',
@@ -95,112 +89,105 @@ class SecurityConfig:
         'Permissions-Policy': 'geolocation=(), microphone=(), camera=()'
     }
 
+
 class InputValidator:
     """Input validation and sanitization utilities"""
-    
+
     @staticmethod
     def sanitize_string(text: str, max_length: int = 1000) -> str:
-        """Sanitize string input"""
         if not text:
             return ""
-        
-        # Clean HTML/Script tags
-        cleaned = bleach.clean(text, tags=[], strip=True)
-        
-        # Limit length
-        if len(cleaned) > max_length:
-            cleaned = cleaned[:max_length]
-        
-        return cleaned.strip()
-    
+        # Strip HTML tags with a simple regex (avoids bleach dependency)
+        cleaned = re.sub(r'<[^>]+>', '', text)
+        return cleaned[:max_length].strip()
+
     @staticmethod
     def validate_filename(filename: str) -> bool:
-        """Validate filename format"""
         if not filename:
             return False
-        
-        # Check pattern
         if not SecurityConfig.PATTERNS['filename'].match(filename):
             return False
-        
-        # Check extension
         ext = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
         return ext in SecurityConfig.ALLOWED_EXTENSIONS
-    
+
     @staticmethod
     def validate_api_key(api_key: str) -> bool:
-        """Validate API key format"""
         if not api_key:
             return False
-        
         return bool(SecurityConfig.PATTERNS['api_key'].match(api_key))
-    
+
     @staticmethod
     def validate_file_upload(file) -> tuple[bool, Optional[str]]:
-        """Comprehensive file validation with security checks"""
+        """Validate uploaded file with comprehensive security checks"""
         if not file:
             return False, "No file provided"
-        
         if file.filename == '':
             return False, "Empty filename"
         
-        # Validate filename
+        # Validate filename format and extension
         if not InputValidator.validate_filename(file.filename):
-            return False, "Invalid filename"
+            return False, "Invalid filename format or unsupported file extension"
         
-        # Check file size first
+        # Validate MIME type
+        if file.content_type not in SecurityConfig.ALLOWED_MIME_TYPES:
+            return False, f"Unsupported file type. Allowed types: jpg, png, webp"
+        
+        # Check file size
         file.seek(0, os.SEEK_END)
         file_size = file.tell()
         file.seek(0)
         
-        if file_size > SecurityConfig.MAX_CONTENT_LENGTH:
-            return False, f"File too large. Max size: {SecurityConfig.MAX_CONTENT_LENGTH // (1024*1024)}MB"
-        
         if file_size == 0:
             return False, "File is empty"
         
-        # Read file content for validation
-        file_content = file.read()
-        file.seek(0)
+        if file_size > SecurityConfig.MAX_CONTENT_LENGTH:
+            max_size_mb = SecurityConfig.MAX_CONTENT_LENGTH / (1024 * 1024)
+            return False, f"File too large. Maximum size: {max_size_mb}MB"
         
-        # Check for malicious file signatures
-        is_malicious, malicious_msg = InputValidator._check_malicious_signatures(file_content)
-        if is_malicious:
-            return False, f"Malicious file detected: {malicious_msg}"
-        
-        # Validate MIME type using python-magic or fallback
+        # Validate image dimensions and detect malicious files
         try:
-            if MAGIC_AVAILABLE:
-                detected_mime = magic.from_buffer(file_content, mime=True)
-            else:
-                # Fallback: use PIL to detect image format
-                try:
-                    image = Image.open(io.BytesIO(file_content))
-                    format_to_mime = {
-                        'JPEG': 'image/jpeg',
-                        'PNG': 'image/png',
-                        'GIF': 'image/gif',
-                        'WEBP': 'image/webp'
-                    }
-                    detected_mime = format_to_mime.get(image.format, 'application/octet-stream')
-                except:
-                    detected_mime = file.content_type or 'application/octet-stream'
+            file_data = file.read()
+            file.seek(0)  # Reset file pointer
             
-            if detected_mime not in SecurityConfig.ALLOWED_MIME_TYPES:
-                return False, f"Unsupported file type detected: {detected_mime}"
+            # Attempt to open as image (will fail for malicious files)
+            img = Image.open(io.BytesIO(file_data))
+            
+            # Verify image format matches extension
+            img_format = img.format.lower() if img.format else ''
+            allowed_formats = {'jpeg', 'jpg', 'png', 'webp'}
+            if img_format not in allowed_formats:
+                return False, f"Invalid image format. Allowed formats: jpg, png, webp"
+            
+            # Check image dimensions
+            width, height = img.size
+            
+            if width < SecurityConfig.MIN_IMAGE_WIDTH or height < SecurityConfig.MIN_IMAGE_HEIGHT:
+                return False, f"Image too small. Minimum dimensions: {SecurityConfig.MIN_IMAGE_WIDTH}x{SecurityConfig.MIN_IMAGE_HEIGHT}px"
+            
+            if width > SecurityConfig.MAX_IMAGE_WIDTH or height > SecurityConfig.MAX_IMAGE_HEIGHT:
+                return False, f"Image too large. Maximum dimensions: {SecurityConfig.MAX_IMAGE_WIDTH}x{SecurityConfig.MAX_IMAGE_HEIGHT}px"
+            
+            # Verify image can be loaded (detects corrupted/malicious files)
+            img.verify()
+            
+            # Re-open for additional checks after verify()
+            img = Image.open(io.BytesIO(file_data))
+            
+            # Check for suspicious metadata or embedded scripts
+            if hasattr(img, 'info') and img.info:
+                # Check for suspicious keys in metadata
+                suspicious_keys = ['comment', 'software', 'exif']
+                for key in suspicious_keys:
+                    if key in img.info:
+                        value = str(img.info[key]).lower()
+                        if any(pattern in value for pattern in ['<script', 'javascript:', 'data:', 'vbscript:']):
+                            return False, "Suspicious content detected in image metadata"
+            
         except Exception as e:
-            logging.warning(f"MIME type detection failed: {e}")
-            # Fallback to content-type header
-            if file.content_type not in SecurityConfig.ALLOWED_MIME_TYPES:
-                return False, f"Unsupported file type: {file.content_type}"
-        
-        # Validate image content
-        is_valid_image, image_msg = InputValidator._validate_image_content(file_content)
-        if not is_valid_image:
-            return False, f"Invalid image: {image_msg}"
+            return False, f"Invalid or corrupted image file: {str(e)}"
         
         return True, None
-    
+
     @staticmethod
     def _check_malicious_signatures(file_content: bytes) -> Tuple[bool, str]:
         """Check for malicious file signatures"""
@@ -267,19 +254,35 @@ class InputValidator:
     
     @staticmethod
     def secure_filename_custom(filename: str) -> str:
-        """Custom secure filename generation"""
+        """Custom secure filename generation with path traversal protection"""
+        # Remove any path components
+        filename = os.path.basename(filename)
+        
         # Use Werkzeug's secure_filename as base
         secure_name = secure_filename(filename)
+        
+        # Additional sanitization: remove any remaining suspicious characters
+        secure_name = re.sub(r'[^\w\s.-]', '', secure_name)
+        
+        # Prevent path traversal attempts
+        if '..' in secure_name or secure_name.startswith('.'):
+            secure_name = secure_name.replace('..', '').lstrip('.')
         
         # Add timestamp to prevent collisions
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         name, ext = os.path.splitext(secure_name)
         
+        # Ensure extension is lowercase and valid
+        ext = ext.lower()
+        if ext.lstrip('.') not in SecurityConfig.ALLOWED_EXTENSIONS:
+            ext = '.jpg'  # Default to jpg if invalid
+        
         return f"{name}_{timestamp}{ext}"
+
 
 class APIKeyManager:
     """API key management utilities"""
-    
+
     @staticmethod
     def generate_api_key(tier: str = 'free') -> str:
         """Generate a secure API key with tier prefix"""
@@ -307,36 +310,37 @@ class APIKeyManager:
             }
         }
     
+    def generate_api_key() -> str:
+        import secrets
+        return secrets.token_urlsafe(32)
+
     @staticmethod
     def hash_api_key(api_key: str) -> str:
-        """Hash API key for storage"""
         return hashlib.sha256(api_key.encode()).hexdigest()
-    
+
     @staticmethod
     def verify_api_key(api_key: str, hashed_key: str) -> bool:
-        """Verify API key against hash"""
         return hmac.compare_digest(
             hashlib.sha256(api_key.encode()).hexdigest(),
             hashed_key
         )
 
+
 class RateLimitManager:
     """Rate limiting utilities with tier-based access"""
     
+    """Rate limiting utilities"""
+
     @staticmethod
     def get_client_ip() -> str:
-        """Get client IP address"""
-        # Check for proxy headers
         if request.headers.get('X-Forwarded-For'):
             return request.headers.get('X-Forwarded-For').split(',')[0].strip()
         elif request.headers.get('X-Real-IP'):
             return request.headers.get('X-Real-IP')
-        else:
-            return request.remote_addr or 'unknown'
-    
+        return request.remote_addr or 'unknown'
+
     @staticmethod
     def get_rate_limit_key(endpoint: str = None) -> str:
-        """Generate rate limit key"""
         ip = RateLimitManager.get_client_ip()
         endpoint = endpoint or request.endpoint or 'unknown'
         return f"rate_limit:{endpoint}:{ip}"
@@ -382,120 +386,86 @@ class RateLimitManager:
             return f"{tier}:{ip}"
         return tiered_key
 
+
 class SecurityMiddleware:
     """Security middleware for Flask application"""
-    
+
     def __init__(self, app=None):
         self.app = app
         if app is not None:
             self.init_app(app)
-    
+
     def init_app(self, app):
-        """Initialize security middleware"""
+        self._app = app
         app.before_request(self.before_request)
         app.after_request(self.after_request)
-    
+
     def before_request(self):
-        """Before request security checks"""
-        # Validate request size
         content_length = request.content_length or 0
         if content_length > SecurityConfig.MAX_CONTENT_LENGTH:
             abort(413, description="Request too large")
-        
-        # Log suspicious activity
         self._log_request()
-    
+
     def after_request(self, response):
-        """Add security headers to response"""
         for header, value in SecurityConfig.SECURITY_HEADERS.items():
             response.headers[header] = value
-        
         return response
-    
+
     def _log_request(self):
-        """Log request for security monitoring"""
         ip = RateLimitManager.get_client_ip()
-        user_agent = request.headers.get('User-Agent', 'Unknown')
-        endpoint = request.endpoint or 'unknown'
-        
-        # Log suspicious patterns
-        suspicious_patterns = [
-            '../', '<script', 'javascript:', 'data:',
-            'vbscript:', 'onload=', 'onerror='
-        ]
-        
+        suspicious_patterns = ['../', '<script', 'javascript:', 'data:', 'vbscript:', 'onload=', 'onerror=']
         request_data = str(request.data) if request.data else ""
         for pattern in suspicious_patterns:
             if pattern.lower() in request_data.lower():
-                app.logger.warning(
-                    f"Suspicious request from {ip}: {pattern} in {endpoint}"
-                )
+                self._app.logger.warning(f"Suspicious request from {ip}: pattern '{pattern}' detected")
                 break
 
-# Security helper functions
-def is_safe_url(url: str) -> bool:
-    """Check if URL is safe for redirects"""
-    if not url:
-        return False
-    
-    # Prevent open redirects
-    if url.startswith(('//', 'http://', 'https://')):
-        return False
-    
-    return True
 
-def validate_json_input(data: Dict[str, Any], required_fields: list = None) -> tuple[bool, Optional[str]]:
-    """Validate JSON input"""
-    if not isinstance(data, dict):
-        return False, "Invalid JSON format"
-    
-    if required_fields:
-        missing_fields = [field for field in required_fields if field not in data]
-        if missing_fields:
-            return False, f"Missing required fields: {', '.join(missing_fields)}"
-    
-    return True, None
-
-# Security monitoring
 class SecurityMonitor:
     """Security monitoring and alerting"""
-    
+
     def __init__(self, app=None):
         self.app = app
-        self.suspicious_ips = {}
+        self.suspicious_ips: Dict[str, Any] = {}
         if app is not None:
             self.init_app(app)
-    
+
     def init_app(self, app):
-        """Initialize security monitor"""
+        self._app = app
         app.before_request(self.monitor_request)
-    
+
     def monitor_request(self):
-        """Monitor requests for suspicious activity"""
         ip = RateLimitManager.get_client_ip()
         current_time = datetime.now()
-        
-        # Track requests per IP
         if ip not in self.suspicious_ips:
             self.suspicious_ips[ip] = {'count': 0, 'first_seen': current_time}
-        
         self.suspicious_ips[ip]['count'] += 1
-        
-        # Check for unusual patterns
         if self._is_suspicious(ip):
-            app.logger.warning(f"Suspicious activity detected from {ip}")
-    
+            self._app.logger.warning(f"Suspicious activity detected from {ip}")
+
     def _is_suspicious(self, ip: str) -> bool:
-        """Determine if IP is showing suspicious behavior"""
         data = self.suspicious_ips[ip]
-        
-        # High request rate
-        if data['count'] > 1000:  # More than 1000 requests
+        if data['count'] > 1000:
             return True
-        
-        # Check time-based patterns
         time_diff = datetime.now() - data['first_seen']
-        if time_diff.total_seconds() < 60 and data['count'] > 100:  # 100 requests in 1 minute
+        if time_diff.total_seconds() < 60 and data['count'] > 100:
             return True
-        
         return False
+
+
+def is_safe_url(url: str) -> bool:
+    if not url:
+        return False
+    if url.startswith(('//', 'http://', 'https://')):
+        return False
+    return True
+
+
+def validate_json_input(data: Dict[str, Any], required_fields: list = None) -> Tuple[bool, Optional[str]]:
+    if not isinstance(data, dict):
+        return False, "Invalid JSON format"
+    if required_fields:
+        missing = [f for f in required_fields if f not in data]
+        if missing:
+            return False, f"Missing required fields: {', '.join(missing)}"
+    return True, None

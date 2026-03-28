@@ -1,3 +1,5 @@
+import { ApiErrorResponse } from "../types";
+
 interface ApiResponse<T = any> {
   data?: T;
   error?: string;
@@ -13,7 +15,7 @@ class ApiError extends Error {
   constructor(
     message: string,
     public status: number,
-    public data?: any,
+    public data?: ApiErrorResponse,
   ) {
     super(message);
     this.name = "ApiError";
@@ -33,26 +35,26 @@ const apiRequest = async <T = any>(
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const isFormData = typeof FormData !== "undefined" && fetchOptions.body instanceof FormData;
-      const defaultHeaders = isFormData ? {} : { "Content-Type": "application/json" };
+      const defaultHeaders: Record<string, string> = isFormData ? {} : { "Content-Type": "application/json" };
 
       const response = await fetch(url, {
+        ...fetchOptions,
         headers: {
           ...defaultHeaders,
-          ...fetchOptions.headers,
+          ...(fetchOptions.headers as Record<string, string>),
         },
-        ...fetchOptions,
       });
 
       const data = await response.json().catch(() => null);
 
       if (!response.ok) {
         const errorMessage =
-          data?.error || data?.message || `HTTP ${response.status}`;
+          (data as ApiErrorResponse)?.error || (data as ApiErrorResponse)?.message || `HTTP ${response.status}`;
         throw new ApiError(errorMessage, response.status, data);
       }
 
       return {
-        data,
+        data: data as T,
         status: response.status,
       };
     } catch (error) {

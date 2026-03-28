@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, g
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -9,38 +9,33 @@ import logging
 from functools import wraps
 from datetime import datetime
 
-# Import security modules
 from security_config import (
-    SecurityConfig, InputValidator, APIKeyManager, 
+    SecurityConfig, InputValidator, APIKeyManager,
     RateLimitManager, SecurityMiddleware, SecurityMonitor,
     validate_json_input, is_safe_url
 )
 
-# Import performance monitoring
-from monitoring import MonitoringMiddleware, track_inference, update_model_accuracy
-
-# Import model validator
-from model_validator import ModelValidator, FileValidationResult
-from model_registry import ModelRegistry
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Import and configure structured logging
+from logger_config import setup_logger
+logger = setup_logger(__name__)
 
 app = Flask(__name__)
 
-# Configuration
+
 class Config:
     SECRET_KEY = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
-    REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379')
+    REDIS_URL = os.environ.get('REDIS_URL', '')
     API_KEYS = os.environ.get('API_KEYS', '').split(',') if os.environ.get('API_KEYS') else []
-    RATE_LIMIT_STORAGE_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379')
     UPLOAD_FOLDER = 'uploads'
+    MAX_CONTENT_LENGTH = SecurityConfig.MAX_CONTENT_LENGTH
     ENV = os.environ.get('FLASK_ENV', 'development')
+    MAX_CONTENT_LENGTH = 10 * 1024 * 1024  # 10MB limit
+
 
 app.config.from_object(Config)
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# Initialize security middleware
+# Security middleware
 security_middleware = SecurityMiddleware(app)
 security_monitor = SecurityMonitor(app)
 
@@ -63,8 +58,7 @@ limiter = Limiter(
     default_limits=["20 per minute"]
 )
 
-# CORS Configuration
-CORS(app, 
+CORS(app,
      origins=['http://localhost:3000', 'https://yourdomain.com'],
      methods=['GET', 'POST', 'PUT', 'DELETE'],
      allow_headers=['Content-Type', 'Authorization', 'X-API-Key'],
@@ -85,87 +79,51 @@ def tiered_rate_limit(endpoint_name: str):
         return decorated_function
     return decorator
 # API Key Authentication
+
 def require_api_key(f):
     @wraps(f)
-    def decorated_function(*args, **kwargs):
-        # Skip API key check in development
+    def decorated(*args, **kwargs):
         if app.config.get('ENV') == 'development':
             return f(*args, **kwargs)
-            
         api_key = request.headers.get('X-API-Key')
         if not api_key:
             logger.warning(f"Missing API key from {RateLimitManager.get_client_ip()}")
             return jsonify({'error': 'API key required'}), 401
-        
-        # Validate API key format
         if not InputValidator.validate_api_key(api_key):
             logger.warning(f"Invalid API key format from {RateLimitManager.get_client_ip()}")
             return jsonify({'error': 'Invalid API key format'}), 401
-        
         if api_key not in app.config['API_KEYS']:
             logger.warning(f"Unauthorized API key from {RateLimitManager.get_client_ip()}")
             return jsonify({'error': 'Invalid API key'}), 401
-            
         return f(*args, **kwargs)
-    return decorated_function
+    return decorated
 
-# Rate Limiting for Specific Endpoints
+
 @app.route('/predict', methods=['POST'])
 @tiered_rate_limit('predict')
 @require_api_key
 @track_inference
 def predict():
-    """Food classification endpoint with comprehensive security measures"""
+    """Food classification endpoint"""
     start_time = time.time()
-    
     try:
-        # Validate input using security module
         if 'image' not in request.files:
             return jsonify({'error': 'No image provided'}), 400
-        
+
         file = request.files['image']
-        
-        # Enhanced file validation using security module
         is_valid, error_msg = InputValidator.validate_file_upload(file)
         if not is_valid:
             logger.warning(f"File validation failed: {error_msg}")
-            return jsonify({
-                'error': error_msg,
-                'error_type': 'validation_failed',
-                'timestamp': datetime.now().isoformat()
-            }), 400
-        
-        # Additional validation using model validator if available
-        if model_validator:
-            try:
-                validation_result = model_validator.validate_uploaded_file(file)
-                if not validation_result.is_valid:
-                    logger.warning(f"Model validator failed: {validation_result.validation_errors}")
-                    return jsonify({
-                        'error': 'File validation failed',
-                        'details': validation_result.validation_errors,
-                        'error_type': 'security_validation_failed',
-                        'timestamp': datetime.now().isoformat()
-                    }), 400
-                
-                # Log validation details for monitoring
-                logger.info(f"File validated successfully: {validation_result.filename}, "
-                           f"size: {validation_result.file_size}, "
-                           f"mime: {validation_result.detected_mime_type}, "
-                           f"dimensions: {validation_result.image_dimensions}")
-                           
-            except Exception as e:
-                logger.error(f"Model validator error: {str(e)}")
-                # Continue with basic validation if model validator fails
-        
-        # Generate secure filename
+            return jsonify({'error': error_msg}), 400
+
         filename = InputValidator.secure_filename_custom(file.filename)
-        
-        # Mock prediction logic (replace with actual model)
+        save_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(save_path)
+
+        # TODO: replace with actual model inference
         processing_time = time.time() - start_time
-        
         logger.info(f"Prediction completed for {filename} in {processing_time:.3f}s")
-        
+
         return jsonify({
             'prediction': 'Sample food',
             'confidence': 0.95,
@@ -177,115 +135,12 @@ def predict():
                 'size': file.tell() if hasattr(file, 'tell') else 'unknown'
             }
         })
-        
+
     except Exception as e:
-        logger.error(f"Prediction error: {str(e)}")
+        logger.error(f"Prediction error: {str(e)}", exc_info=True)
         return jsonify({'error': 'Internal server error'}), 500
 
-# File validation endpoint for testing and monitoring
-@app.route('/validate-file', methods=['POST'])
-@tiered_rate_limit('upload')
-@require_api_key
-def validate_file():
-    """Dedicated file validation endpoint"""
-    try:
-        if 'file' not in request.files:
-            return jsonify({'error': 'No file provided'}), 400
-        
-        file = request.files['file']
-        
-        if not model_validator:
-            # Fallback to basic security validation
-            is_valid, error_msg = InputValidator.validate_file_upload(file)
-            return jsonify({
-                'is_valid': is_valid,
-                'error': error_msg if not is_valid else None,
-                'validation_type': 'basic_security'
-            })
-        
-        # Comprehensive validation
-        validation_result = model_validator.validate_uploaded_file(file)
-        
-        response = {
-            'is_valid': validation_result.is_valid,
-            'filename': validation_result.filename,
-            'file_size': validation_result.file_size,
-            'detected_mime_type': validation_result.detected_mime_type,
-            'image_dimensions': validation_result.image_dimensions,
-            'file_hash': validation_result.file_hash,
-            'validation_errors': validation_result.validation_errors,
-            'security_flags': validation_result.security_flags,
-            'validation_type': 'comprehensive',
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        # Log validation results
-        if validation_result.is_valid:
-            logger.info(f"File validation successful: {validation_result.filename}")
-        else:
-            logger.warning(f"File validation failed: {validation_result.filename}, "
-                          f"errors: {validation_result.validation_errors}")
-        
-        return jsonify(response)
-        
-    except Exception as e:
-        logger.error(f"File validation error: {str(e)}")
-        return jsonify({'error': 'Internal server error'}), 500
 
-# Batch file validation endpoint
-@app.route('/validate-files', methods=['POST'])
-@tiered_rate_limit('upload')
-@require_api_key
-def validate_files():
-    """Batch file validation endpoint"""
-    try:
-        if not model_validator:
-            return jsonify({'error': 'Batch validation not available'}), 503
-        
-        files = request.files.getlist('files')
-        if not files:
-            return jsonify({'error': 'No files provided'}), 400
-        
-        # Prepare file list for batch validation
-        file_list = [(file, file.filename) for file in files]
-        
-        # Perform batch validation
-        validation_results = model_validator.batch_validate_files(file_list)
-        
-        # Get summary statistics
-        summary = model_validator.get_validation_summary(validation_results)
-        
-        # Convert results to dict for JSON serialization
-        results_dict = []
-        for result in validation_results:
-            results_dict.append({
-                'filename': result.filename,
-                'is_valid': result.is_valid,
-                'file_size': result.file_size,
-                'detected_mime_type': result.detected_mime_type,
-                'image_dimensions': result.image_dimensions,
-                'file_hash': result.file_hash,
-                'validation_errors': result.validation_errors,
-                'security_flags': result.security_flags
-            })
-        
-        response = {
-            'results': results_dict,
-            'summary': summary,
-            'validation_type': 'batch_comprehensive',
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        logger.info(f"Batch validation completed: {summary['total_files']} files, "
-                   f"{summary['valid_files']} valid, {summary['security_issues']} security issues")
-        
-        return jsonify(response)
-        
-    except Exception as e:
-        logger.error(f"Batch file validation error: {str(e)}")
-        return jsonify({'error': 'Internal server error'}), 500
-
-# Health check endpoint (exempt from rate limiting)
 @app.route('/health', methods=['GET'])
 @limiter.exempt
 def health_check():
@@ -373,7 +228,7 @@ def health_check():
             'error': str(e)
         }), 500
 
-# API info endpoint
+
 @app.route('/api/info', methods=['GET'])
 @limiter.limit("30 per minute")
 def api_info():
@@ -437,7 +292,7 @@ def api_info():
         }
     })
 
-# API key generation endpoint (admin only)
+
 @app.route('/admin/api-key/generate', methods=['POST'])
 @tiered_rate_limit('generate_api_key')
 def generate_api_key():
@@ -457,6 +312,8 @@ def generate_api_key():
     key_info = APIKeyManager.generate_tiered_api_key(tier)
     logger.info(f"New {tier} API key generated")
     
+    new_key = APIKeyManager.generate_api_key()
+    logger.info("New API key generated")
     return jsonify({
         'api_key': key_info['api_key'],
         'tier': key_info['tier'],
@@ -499,14 +356,11 @@ def ratelimit_handler(e):
         'endpoint': endpoint
     }), 429
 
+
 @app.errorhandler(404)
 def not_found_handler(e):
     return jsonify({'error': 'Endpoint not found'}), 404
 
-@app.errorhandler(500)
-def internal_error_handler(e):
-    logger.error(f"Internal server error: {str(e)}")
-    return jsonify({'error': 'Internal server error'}), 500
 
 @app.errorhandler(413)
 def request_too_large_handler(e):
@@ -514,6 +368,13 @@ def request_too_large_handler(e):
         'error': 'Request too large',
         'max_size': '16MB'
     }), 413
+
+
+@app.errorhandler(500)
+def internal_error_handler(e):
+    logger.error(f"Internal server error: {str(e)}")
+    return jsonify({'error': 'Internal server error'}), 500
+
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
