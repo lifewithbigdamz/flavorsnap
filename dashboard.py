@@ -1,35 +1,22 @@
+from src.ui import theme_manager, ImageViewer, LoadingUI, SkeletonCard
+from src.core import ProgressClassifier
+from src.utils.memory_manager import MemoryManager
+from src.ui.export_panel import ExportPanel
+from src.ui.realtime_preview import RealtimePreview
 import panel as pn
 import torch
+import torchvision.models as models
 import torchvision.transforms as transforms
-from torchvision import models
 from PIL import Image
 import io
 import os
 import sys
-from pathlib import Path
 
-# Add src to Python path for imports
-sys.path.insert(0, str(Path(__file__).parent / 'src'))
 
-from src.ui.preprocessing_controls import PreprocessingControls
-from src.ui.confidence_chart import create_confidence_chart
-from src.ui.error_messages import handle_and_display_error, create_error_banner, setup_error_styles
-from src.core.image_enhancer import ImageEnhancer
-from src.core.classifier import FlavorSnapClassifier
-from src.utils.error_handler import handle_user_errors, validate_image_file, UserFriendlyError
+# Ensure src module is visible
+sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
-# Configure Panel extensions with custom CSS and JS
-pn.extension('css', js_files={
-    'charts': ['static/js/charts.js']
-}, css_files={
-    'charts': ['static/css/charts.css'],
-    'error': ['static/css/error.css']
-})
 
-# Load model using the enhanced classifier
-classifier = FlavorSnapClassifier()
-model = classifier.model
-class_names = classifier.class_names
 
 # Transforms
 transform = transforms.Compose([
@@ -39,10 +26,11 @@ transform = transforms.Compose([
 
 # Save image to correct folder
 def save_image(image_obj, predicted_class, image_name="uploaded_image.jpg"):
-    save_dir = f"data/train/{predicted_class}"
+    save_dir = os.path.join(upload_dir, predicted_class)
     os.makedirs(save_dir, exist_ok=True)
     image_path = os.path.join(save_dir, image_name)
     image_obj.save(image_path)
+
 
 # Panel UI
 image_input = pn.widgets.FileInput(accept='image/*')
@@ -63,6 +51,10 @@ confidence_chart_component = confidence_chart.create_layout()
 preprocessing_controls = PreprocessingControls()
 preprocessing_panel = preprocessing_controls.create_layout()
 
+# Real-time preview component
+realtime_preview = RealtimePreview()
+realtime_preview_panel = realtime_preview.create_layout()
+
 # Global variables
 original_image = None
 processed_image = None
@@ -74,6 +66,13 @@ def on_image_update(image):
     if image:
         processed_preview.object = image
         processed_preview.visible = True
+
+def on_realtime_update(image, preprocessing_params):
+    """Handle real-time classification updates."""
+    global processed_image
+    if image and realtime_preview.realtime_enabled:
+        processed_image = image
+        realtime_preview.update_image(original_image, image, preprocessing_params)
 
 @handle_user_errors("image upload and processing")
 def handle_image_upload():
@@ -104,6 +103,7 @@ def handle_image_upload():
     # Load image into preprocessing controls
     preprocessing_controls.load_image(original_image)
     preprocessing_controls.on_image_update = on_image_update
+    preprocessing_controls.set_realtime_callback(on_realtime_update)
     
     output.object = "📸 Image loaded! Use preprocessing controls to enhance, then classify."
 
@@ -118,25 +118,32 @@ def classify(event=None):
         processed_preview.visible = False
         return
     
-    if processed_image is None:
-        output.object = "⚠️ Please wait for image to load or apply preprocessing."
-        return
-    
-    # Clear any previous errors
-    error_banner.visible = False
-    
-    # Start spinner
-    spinner.value = True
-    output.object = "🔍 Classifying..."
 
-    # Use processed image for classification
-    image_to_classify = processed_image
 
     # Get preprocessing parameters
     preprocessing_params = preprocessing_controls.get_enhancement_params()
-
-    # Use enhanced classifier for detailed results
-    result = classifier.classify_image(image_to_classify, preprocessing_params)
+    
+    # Check if we have cached results for this image (PWA feature)
+    image_hash = hashlib.md5(image_input.value).hexdigest()
+    cache_key = f"classification_{image_hash}_{hash(str(preprocessing_params))}"
+    
+    if pwa_manager and not pwa_manager.is_online:
+        # Try to get cached result when offline
+        cached_result = pwa_manager.get_cached_api_response(cache_key)
+        if cached_result:
+            result = cached_result
+            output.object = "📱 Using cached classification result (offline mode)"
+        else:
+            output.object = "📱 No cached result available. Please connect to internet."
+            spinner.value = False
+            return
+    else:
+        # Perform classification when online
+        result = classifier.classify_image(image_to_classify, preprocessing_params)
+        
+        # Cache the result for offline use
+        if pwa_manager:
+            pwa_manager.cache_api_response(cache_key, result, expires_in_hours=24)
     
     # Extract results
     predicted_class = result['predicted_class']
@@ -146,36 +153,16 @@ def classify(event=None):
     # Update confidence chart with all probabilities
     confidence_chart.update_predictions(all_probabilities, predicted_class)
 
-    # Save processed image
-    save_image(image_to_classify, predicted_class)
-    
-    # Create enhanced result message
-    confidence_percentage = confidence_score * 100
-    entropy = result['metadata']['entropy']
-    avg_confidence = result['metadata']['average_confidence']
-    
-    result_message = f"""
-✅ **Classification Result: {predicted_class}**
 
-### 🎯 Confidence Scores
-- **Top Prediction:** {predicted_class} ({confidence_percentage:.1f}%)
-- **Model Uncertainty (Entropy):** {entropy:.3f}
-- **Average Confidence:** {avg_confidence:.1f}%
+        # Start spinner
+        spinner.value = True
+        output.object = "🔍 Classifying..."
 
-### 📊 Preprocessing Parameters Applied:
-- **Brightness**: {preprocessing_params['brightness']:.1f}
-- **Contrast**: {preprocessing_params['contrast']:.1f}
-- **Rotation**: {preprocessing_params['rotation']:.0f}°
-- **Aspect Ratio**: {preprocessing_params.get('aspect_ratio', 'Original')}
-- **Crop**: {preprocessing_params.get('crop_box', 'None')}
 
-💾 Processed image saved to training data!
-
-📈 **View the confidence chart below** to see probabilities for all food classes.
-    """
-    
-    output.object = result_message
-    spinner.value = False
+    except Exception as e:
+        output.object = f"❌ Error: {str(e)}"
+        spinner.value = False
+        confidence_chart.reset()
 
 # Setup image upload handler with error handling
 def handle_image_upload_with_error_handling():
@@ -185,8 +172,89 @@ def handle_image_upload_with_error_handling():
     except UserFriendlyError as e:
         handle_and_display_error(e, "image upload", handle_image_upload_with_error_handling)
     except Exception as e:
-        handle_and_display_error(e, "image upload", handle_image_upload_with_error_handling)
+        output.object = f"❌ Error: {str(e)}"
+        # Reset chart on error
+        confidence_chart.reset()
+    finally:
+        spinner.value = False
 
+def manual_export():
+    if current_image and current_predicted_class:
+        save_image(current_image, current_predicted_class, image_name="manual_export.jpg")
+        output.object = f"💾 Manually exported results for **{current_predicted_class}**"
+
+def export_callback(action, data=None):
+    """Callback for export panel operations"""
+    if action == 'get_current_data':
+        if current_image and current_predicted_class:
+            return {
+                'image': current_image,
+                'predicted_class': current_predicted_class,
+                'confidence': current_confidence,
+                'timestamp': datetime.now().isoformat()
+            }
+        return None
+    elif action == 'get_batch_data':
+        return classification_history.copy()
+    elif action == 'export_completed':
+        output.object = f"📤 Export completed: {data.get('filepath', 'unknown')}"
+    elif action == 'batch_export_completed':
+        output.object = f"📤 Batch export completed: {data.get('count', 0)} items exported to {data.get('filepath', 'unknown')}"
+    return None
+
+def handle_shortcut(combo):
+    global current_image, current_predicted_class
+    if combo == 'enter':
+        classify()
+    elif combo == 'escape':
+        ui.clear_image()
+        current_image = None
+        current_predicted_class = None
+    elif combo == 'ctrl+s':
+        manual_export()
+    elif combo == 'ctrl+h':
+        ui.toggle_history()
+    elif combo == 'ctrl+d':
+        # Toggle dark mode
+        if 'dark-theme' in app.css_classes:
+            app.css_classes = [c for c in app.css_classes if c != 'dark-theme']
+            try:
+                pn.config.theme = 'default'
+            except:
+                pass
+        else:
+            app.css_classes = app.css_classes + ['dark-theme']
+            try:
+                pn.config.theme = 'dark'
+            except:
+                pass
+
+# Export panel setup
+export_panel = ExportPanel(on_export_callback=export_callback)
+
+ui = MainInterface(classify_fn=classify, save_image_fn=manual_export)
+keyboard_manager = KeyboardManager(handle_shortcut)
+
+# Theme toggle button
+theme_toggle = pn.widgets.Button(name='🌙', button_type='light', width=50)
+theme_toggle.on_click(lambda event: handle_shortcut('ctrl+d'))
+
+# Header
+header = pn.Row(
+    pn.pane.Markdown("# 🍽️ FlavorSnap", styles={'margin-top': '0px', 'flex': '1'}),
+    theme_toggle,
+    sizing_mode='stretch_width',
+    css_classes=['header']
+)
+
+# Dashboard Layout
+dashboard_body = pn.Row(
+    ui.get_layout(),
+    export_panel.get_panel(),
+    sizing_mode='stretch_width'
+)
+
+# Setup image upload handler with error handling
 image_input.param.watch(lambda event: handle_image_upload_with_error_handling(), 'value')
 
 # Setup classification handler with error handling
@@ -205,7 +273,17 @@ def classify_with_error_handling(event):
 run_button = pn.widgets.Button(name='Classify', button_type='primary')
 run_button.on_click(classify_with_error_handling)
 
-# Create layout with preprocessing controls
+# Create PWA status indicator
+pwa_status = pn.pane.HTML("""
+<div id="pwa-status" style="position: fixed; top: 10px; right: 10px; z-index: 1000;">
+    <span id="connection-status" class="online-indicator">🌐 Online</span>
+    <button id="pwa-install-button" style="display: none; margin-left: 10px;" class="pwa-install-btn">
+        📱 Install App
+    </button>
+</div>
+""")
+
+# Create layout with preprocessing controls and PWA features
 upload_section = pn.Column(
     "## 📤 Upload Image",
     image_input,
@@ -236,18 +314,36 @@ confidence_section = pn.Column(
     confidence_chart_component,
 )
 
+realtime_section = pn.Column(
+    "## 🔄 Real-time Preview",
+    realtime_preview_panel,
+)
+
+# Main app layout with real-time preview
 app = pn.Row(
     pn.Column(
+        pwa_status,
         upload_section,
         preview_section,
         error_banner,  # Add error banner to the layout
         classification_section,
         confidence_section,
+        realtime_section,
         sizing_mode='stretch_width',
-        max_width=800,
+        max_width=900,
     ),
     controls_section,
     sizing_mode='stretch_width',
 )
 
+# Add PWA JavaScript to the app
+app = pn.Column(
+    pn.pane.HTML(pwa_js_template),
+    app
+)
+
 app.servable()
+
+# Cleanup PWA manager on exit
+import atexit
+atexit.register(lambda: pwa_manager.close() if pwa_manager else None)

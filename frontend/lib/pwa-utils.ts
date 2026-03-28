@@ -1,11 +1,21 @@
-export interface BeforeInstallPromptEvent extends Event {
-  readonly platforms: string[];
-  readonly userChoice: Promise<{
-    outcome: 'accepted' | 'dismissed';
-    platform: string;
-  }>;
-  prompt(): Promise<void>;
+export interface ClassificationCache {
+  id: number;
+  timestamp: string;
+  food: string;
+  confidence: number;
+  calories?: number;
+  imageUrl?: string;
+  cachedAt: string;
 }
+
+export interface OfflineStore {
+  classifications: ClassificationCache[];
+  lastSync?: string;
+}
+
+const OFFLINE_STORE_KEY = 'flavorsnap-offline-store';
+const MAX_OFFLINE_ITEMS = 50;
+const CACHE_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 export interface PushSubscriptionOptions {
   userVisibleOnly: boolean;
@@ -17,6 +27,7 @@ export class PWAManager {
   private deferredPrompt: BeforeInstallPromptEvent | null = null;
   private swRegistration: ServiceWorkerRegistration | null = null;
   private isInstalled: boolean = false;
+  private offlineStore: OfflineStore = { classifications: [] };
 
   static getInstance(): PWAManager {
     if (!PWAManager.instance) {
@@ -28,6 +39,40 @@ export class PWAManager {
   private constructor() {
     this.initializeServiceWorker();
     this.setupInstallPrompt();
+    this.loadOfflineStore();
+  }
+
+  private loadOfflineStore() {
+    if (typeof window !== 'undefined') {
+      try {
+        const stored = localStorage.getItem(OFFLINE_STORE_KEY);
+        if (stored) {
+          this.offlineStore = JSON.parse(stored);
+          // Clean expired entries
+          this.cleanExpiredCache();
+        }
+      } catch (error) {
+        console.error('Failed to load offline store:', error);
+      }
+    }
+  }
+
+  private saveOfflineStore() {
+    if (typeof window !== 'undefined') {
+      try {
+        localStorage.setItem(OFFLINE_STORE_KEY, JSON.stringify(this.offlineStore));
+      } catch (error) {
+        console.error('Failed to save offline store:', error);
+      }
+    }
+  }
+
+  private cleanExpiredCache() {
+    const now = Date.now();
+    this.offlineStore.classifications = this.offlineStore.classifications.filter(
+      item => now - new Date(item.cachedAt).getTime() < CACHE_EXPIRY_MS
+    );
+    this.saveOfflineStore();
   }
 
   private async initializeServiceWorker() {
@@ -316,6 +361,163 @@ export class PWAManager {
       isStandalone: this.isStandalone(),
       canInstall: this.canInstall()
     };
+  }
+
+  // Offline classification caching
+  async cacheClassification(classification: ClassificationCache): Promise<void> {
+    try {
+      // Add to offline store
+      this.offlineStore.classifications.unshift(classification);
+      
+      // Limit cache size
+      if (this.offlineStore.classifications.length > MAX_OFFLINE_ITEMS) {
+        this.offlineStore.classifications = this.offlineStore.classifications.slice(0, MAX_OFFLINE_ITEMS);
+      }
+      
+      this.saveOfflineStore();
+      
+      // Also cache in IndexedDB for larger storage
+      await this.cacheInIndexedDB(classification);
+      
+      console.log('[PWA] Classification cached for offline access');
+    } catch (error) {
+      console.error('[PWA] Failed to cache classification:', error);
+    }
+  }
+
+  // Get cached classifications
+  getCachedClassifications(): ClassificationCache[] {
+    return this.offlineStore.classifications;
+  }
+
+  // Get single cached classification by ID
+  getCachedClassification(id: number): ClassificationCache | undefined {
+    return this.offlineStore.classifications.find(c => c.id === id);
+  }
+
+  // Clear classification cache
+  clearClassificationCache(): void {
+    this.offlineStore.classifications = [];
+    this.saveOfflineStore();
+    this.clearIndexedDBCache();
+    console.log('[PWA] Classification cache cleared');
+  }
+
+  // Check if online
+  async isOnline(): Promise<boolean> {
+    if (typeof window === 'undefined') return false;
+    
+    const online = navigator.onLine;
+    if (!online) return false;
+    
+    // Additional check - try to reach the server
+    try {
+      const response = await fetch('/api/health', { 
+        method: 'HEAD',
+        cache: 'no-cache'
+      });
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  // Sync cached classifications when back online
+  async syncCachedClassifications(syncFn?: (classifications: ClassificationCache[]) => Promise<void>): Promise<number> {
+    const isOnline = await this.isOnline();
+    if (!isOnline) {
+      console.log('[PWA] Still offline, skipping sync');
+      return 0;
+    }
+
+    const cached = this.getCachedClassifications();
+    if (cached.length === 0) {
+      console.log('[PWA] No cached classifications to sync');
+      return 0;
+    }
+
+    try {
+      if (syncFn) {
+        await syncFn(cached);
+      }
+      
+      // Update last sync time
+      this.offlineStore.lastSync = new Date().toISOString();
+      this.saveOfflineStore();
+      
+      console.log(`[PWA] Synced ${cached.length} classifications`);
+      return cached.length;
+    } catch (error) {
+      console.error('[PWA] Sync failed:', error);
+      return 0;
+    }
+  }
+
+  // IndexedDB caching for larger storage
+  private async cacheInIndexedDB(classification: ClassificationCache): Promise<void> {
+    if (typeof indexedDB === 'undefined') return;
+
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open('FlavorSnapDB', 1);
+      
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        const db = request.result;
+        const transaction = db.transaction(['classifications'], 'readwrite');
+        const store = transaction.objectStore('classifications');
+        
+        const putRequest = store.put(classification);
+        putRequest.onsuccess = () => resolve();
+        putRequest.onerror = () => reject(putRequest.error);
+      };
+      
+      request.onupgradeneeded = (event) => {
+        const db = (event.target as IDBOpenDBRequest).result;
+        if (!db.objectStoreNames.contains('classifications')) {
+          db.createObjectStore('classifications', { keyPath: 'id' });
+        }
+      };
+    });
+  }
+
+  private async clearIndexedDBCache(): Promise<void> {
+    if (typeof indexedDB === 'undefined') return;
+
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open('FlavorSnapDB', 1);
+      
+      request.onsuccess = () => {
+        const db = request.result;
+        const transaction = db.transaction(['classifications'], 'readwrite');
+        const store = transaction.objectStore('classifications');
+        
+        const clearRequest = store.clear();
+        clearRequest.onsuccess = () => resolve();
+        clearRequest.onerror = () => reject(clearRequest.error);
+      };
+      
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  private async getAllFromIndexedDB(): Promise<ClassificationCache[]> {
+    if (typeof indexedDB === 'undefined') return [];
+
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open('FlavorSnapDB', 1);
+      
+      request.onsuccess = () => {
+        const db = request.result;
+        const transaction = db.transaction(['classifications'], 'readonly');
+        const store = transaction.objectStore('classifications');
+        
+        const getAllRequest = store.getAll();
+        getAllRequest.onsuccess = () => resolve(getAllRequest.result);
+        getAllRequest.onerror = () => reject(getAllRequest.error);
+      };
+      
+      request.onerror = () => reject(request.error);
+    });
   }
 }
 
