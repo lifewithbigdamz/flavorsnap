@@ -15,6 +15,9 @@ from security_config import (
     validate_json_input, is_safe_url
 )
 
+# Import image optimization module
+from image_optimizer import get_image_optimizer, ImageFormat
+
 # Import and configure structured logging
 from logger_config import setup_logger
 logger = setup_logger(__name__)
@@ -27,13 +30,16 @@ class Config:
     REDIS_URL = os.environ.get('REDIS_URL', '')
     API_KEYS = os.environ.get('API_KEYS', '').split(',') if os.environ.get('API_KEYS') else []
     UPLOAD_FOLDER = 'uploads'
+    OPTIMIZED_FOLDER = 'uploads/optimized'
     MAX_CONTENT_LENGTH = SecurityConfig.MAX_CONTENT_LENGTH
     ENV = os.environ.get('FLASK_ENV', 'development')
     MAX_CONTENT_LENGTH = 10 * 1024 * 1024  # 10MB limit
 
 
+
 app.config.from_object(Config)
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs(app.config['OPTIMIZED_FOLDER'], exist_ok=True)
 
 # Security middleware
 security_middleware = SecurityMiddleware(app)
@@ -95,7 +101,7 @@ def require_api_key(f):
 @require_api_key
 @track_inference
 def predict():
-    """Food classification endpoint"""
+    """Food classification endpoint with automatic image optimization"""
     start_time = time.time()
     try:
         if 'image' not in request.files:
@@ -107,11 +113,45 @@ def predict():
             logger.warning(f"File validation failed: {error_msg}")
             return jsonify({'error': error_msg}), 400
 
-        filename = InputValidator.secure_filename_custom(file.filename)
-        save_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(save_path)
+        # Optimize image before processing
+        try:
+            optimizer = get_image_optimizer()
+            optimization_result = optimizer.optimize_image(
+                file.stream,
+                quality='high',
+                generate_webp=True,
+                generate_thumbnails=True
+            )
+            
+            # Save optimized images
+            base_filename = InputValidator.secure_filename_custom(file.filename)
+            base_filename = os.path.splitext(base_filename)[0]
+            saved_paths = optimizer.save_optimized_images(
+                optimization_result,
+                app.config['OPTIMIZED_FOLDER'],
+                base_filename
+            )
+            
+            logger.info(f"Image optimized: original {optimization_result['metadata']['original_size']}B -> "
+                       f"optimized {optimization_result['metadata']['optimized_size']}B "
+                       f"({optimization_result['metadata']['compression_ratio']}% compression)")
+            
+            # Save original to uploads folder for reference
+            filename = InputValidator.secure_filename_custom(file.filename)
+            save_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            with open(save_path, 'wb') as f:
+                optimization_result['original']['data'].seek(0)
+                f.write(optimization_result['original']['data'].read())
+                
+        except Exception as opt_error:
+            logger.warning(f"Image optimization failed, falling back: {str(opt_error)}")
+            # Fallback: save original
+            filename = InputValidator.secure_filename_custom(file.filename)
+            save_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            file.seek(0)
+            file.save(save_path)
 
-        # TODO: replace with actual model inference
+        # TODO: replace with actual model inference using optimized image
         processing_time = time.time() - start_time
         logger.info(f"Prediction completed for {filename} in {processing_time:.3f}s")
 
@@ -120,11 +160,133 @@ def predict():
             'confidence': 0.95,
             'processing_time': processing_time,
             'timestamp': datetime.now().isoformat(),
-            'request_id': request.headers.get('X-Request-ID', 'unknown')
+            'request_id': request.headers.get('X-Request-ID', 'unknown'),
+            'image_optimization': optimization_result['metadata'] if 'optimization_result' in locals() else None
         })
 
     except Exception as e:
         logger.error(f"Prediction error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+@app.route('/optimize', methods=['POST'])
+@tiered_rate_limit('optimize')
+@require_api_key
+def optimize_image():
+    """Endpoint for image optimization only (returns optimized images and metadata)"""
+    start_time = time.time()
+    try:
+        if 'image' not in request.files:
+            return jsonify({'error': 'No image provided'}), 400
+
+        file = request.files['image']
+        is_valid, error_msg = InputValidator.validate_file_upload(file)
+        if not is_valid:
+            logger.warning(f"File validation failed: {error_msg}")
+            return jsonify({'error': error_msg}), 400
+
+        # Get optimization parameters from request
+        quality = request.form.get('quality', 'high')
+        generate_webp = request.form.get('generate_webp', 'true').lower() == 'true'
+        generate_thumbnails = request.form.get('generate_thumbnails', 'true').lower() == 'true'
+        max_width = int(request.form.get('max_width', 1920))
+        max_height = int(request.form.get('max_height', 1080))
+
+        # Optimize image
+        optimizer = get_image_optimizer()
+        optimization_result = optimizer.optimize_image(
+            file.stream,
+            quality=quality,
+            generate_webp=generate_webp,
+            generate_thumbnails=generate_thumbnails,
+            max_width=max_width,
+            max_height=max_height
+        )
+
+        # Save optimized images
+        base_filename = InputValidator.secure_filename_custom(file.filename)
+        base_filename = os.path.splitext(base_filename)[0]
+        saved_paths = optimizer.save_optimized_images(
+            optimization_result,
+            app.config['OPTIMIZED_FOLDER'],
+            base_filename
+        )
+
+        processing_time = time.time() - start_time
+        logger.info(f"Image optimization endpoint: {optimization_result['metadata']['compression_ratio']}% "
+                   f"compression in {processing_time:.3f}s")
+
+        return jsonify({
+            'status': 'success',
+            'metadata': optimization_result['metadata'],
+            'saved_paths': saved_paths,
+            'sizes': {
+                'original': optimization_result['original']['size'],
+                'optimized': optimization_result['optimized']['size'],
+                'jpeg_fallback': optimization_result['jpeg_fallback']['size'],
+                'thumbnails': {
+                    name: data['size']
+                    for name, data in optimization_result.get('thumbnails', {}).items()
+                }
+            },
+            'processing_time': processing_time
+        }), 200
+
+    except ValueError as ve:
+        logger.warning(f"Image validation error: {str(ve)}")
+        return jsonify({'error': str(ve)}), 400
+    except Exception as e:
+        logger.error(f"Image optimization error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+@app.route('/optimized/<path:filename>', methods=['GET'])
+@limiter.limit("100 per minute")
+def serve_optimized_image(filename: str):
+    """Serve optimized images with proper caching headers"""
+    try:
+        from flask import send_file
+        
+        # Validate filename to prevent directory traversal
+        if not InputValidator.validate_filename(filename):
+            logger.warning(f"Invalid filename requested: {filename}")
+            return jsonify({'error': 'Invalid filename'}), 400
+
+        file_path = os.path.join(app.config['OPTIMIZED_FOLDER'], filename)
+        
+        # Security check: ensure file is within optimized folder
+        if not os.path.abspath(file_path).startswith(os.path.abspath(app.config['OPTIMIZED_FOLDER'])):
+            logger.warning(f"Attempted directory traversal: {filename}")
+            return jsonify({'error': 'Access denied'}), 403
+
+        if not os.path.exists(file_path):
+            return jsonify({'error': 'Image not found'}), 404
+
+        # Determine MIME type
+        if filename.endswith('.webp'):
+            mime_type = 'image/webp'
+        elif filename.endswith('.jpg') or filename.endswith('.jpeg'):
+            mime_type = 'image/jpeg'
+        elif filename.endswith('.png'):
+            mime_type = 'image/png'
+        else:
+            mime_type = 'application/octet-stream'
+
+        # Set aggressive caching headers for optimized images
+        response = send_file(
+            file_path,
+            mimetype=mime_type,
+            cache_timeout=31536000  # 1 year
+        )
+        
+        # Add custom headers for better caching and security
+        response.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
+        response.headers['ETag'] = InputValidator.secure_filename_custom(filename)
+        
+        return response
+
+    except Exception as e:
+        logger.error(f"Error serving optimized image: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
 
 
