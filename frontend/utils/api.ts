@@ -441,6 +441,21 @@ const apiRequest = async <T = any>(
         });
       }
 
+      // If it's not FormData but onProgress is provided, simulate a slow progress
+      // for better UX during JSON/fetch requests
+      let progressInterval: NodeJS.Timeout | null = null;
+      if (!isFormData && onProgress) {
+        let currentProgress = 0;
+        progressInterval = setInterval(() => {
+          currentProgress += Math.random() * 15;
+          if (currentProgress > 95) {
+            if (progressInterval) clearInterval(progressInterval);
+            currentProgress = 95;
+          }
+          onProgress(currentProgress);
+        }, 300);
+      }
+
       const response = await fetch(sanitizedUrl, {
         ...fetchOptions,
         body: sanitizedBody,
@@ -449,6 +464,11 @@ const apiRequest = async <T = any>(
           ...(fetchOptions.headers as Record<string, string>),
         },
       });
+
+      if (progressInterval) {
+        clearInterval(progressInterval);
+        if (onProgress) onProgress(100);
+      }
 
       const data = await response.json().catch(() => null);
 

@@ -4,6 +4,7 @@ import { storage } from "@/utils/storage";
 import { pwaManager } from "@/lib/pwa-utils";
 import { ErrorMessage } from "@/components/ErrorMessage";
 import { ImageUpload } from "@/components/ImageUpload";
+import { ClassificationResult as ClassificationResultComponent } from "@/components/ClassificationResult";
 import { useTranslation } from "next-i18next";
 import { serverSideTranslations } from "next-i18next/serverSideTranslations";
 import type { GetStaticProps } from "next";
@@ -18,6 +19,7 @@ const MAX_HISTORY_ITEMS = 50;
 export default function Classify() {
   const { t } = useTranslation("common");
   const [image, setImage] = useState<string | null>(null);
+  const [imageFile, setImageFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<AppError | null>(null);
   const [classification, setClassification] = useState<ClassificationResult | null>(null);
@@ -40,8 +42,10 @@ export default function Classify() {
 
   const handleReset = () => {
     setImage(null);
+    setImageFile(null);
     setClassification(null);
     setError(null);
+    setUploadProgress(0);
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
@@ -61,13 +65,15 @@ export default function Classify() {
 
       const imageUrl = URL.createObjectURL(file);
       setImage(imageUrl);
+      setImageFile(file);
       setError(null);
       setClassification(null);
+      setUploadProgress(0);
     }
   };
 
   const handleClassify = async () => {
-    if (!image) return;
+    if (!imageFile && !image) return;
 
     setLoading(true);
     setUploadProgress(0);
@@ -76,17 +82,26 @@ export default function Classify() {
     // Announce to screen readers that classification is starting
     const announcement = document.getElementById('classification-announcement');
     if (announcement) {
-      announcement.textContent = t('classifying');
+      announcement.textContent = t('classifying', 'Classifying food...');
     }
 
     try {
-      const response = await api.post<ClassificationResult>('/api/classify', {
-        image: image
-      }, {
+      const formData = new FormData();
+      if (imageFile) {
+        formData.append('image', imageFile);
+      } else if (image) {
+        // Fallback for cases where we only have a blob URL (e.g., from camera)
+        formData.append('image_url', image);
+      }
+
+      const response = await api.post<ClassificationResult>('/api/classify', formData, {
         retries: 2,
         retryDelay: 1000
       }, (progress) => {
         setUploadProgress(progress);
+        if (announcement && progress % 25 === 0) {
+          announcement.textContent = t('upload_progress_voice', 'Upload progress: {{progress}}%', { progress });
+        }
       });
 
       if (response.error) {
@@ -94,27 +109,36 @@ export default function Classify() {
           message: response.error,
           status: response.status
         });
+        if (announcement) announcement.textContent = t('error_prefix', 'Error: ') + response.error;
       } else if (response.data) {
         const result = response.data;
         setClassification(result);
         
         // Add to history
         const newEntry: HistoryEntry = {
+          ...result,
           id: Date.now(),
-          timestamp: new Date().toISOString(),
-          ...result
+          timestamp: result.timestamp || new Date().toISOString()
         };
         
-        setHistory(prev => [newEntry, ...prev].slice(0, MAX_HISTORY_ITEMS));
+        setHistory((prev: HistoryEntry[]) => [newEntry, ...prev].slice(0, MAX_HISTORY_ITEMS));
         
+        // Announce result to screen reader
+        if (announcement) {
+          announcement.textContent = t('classification_complete', 'Classification complete. Result: {{food}} with {{confidence}}% confidence', {
+            food: result.food || result.prediction,
+            confidence: (result.confidence * 100).toFixed(0)
+          });
+        }
+
         // Cache for offline access
         pwaManager.cacheClassification({
           id: newEntry.id,
           timestamp: newEntry.timestamp,
-          food: result.food,
+          food: result.food || result.prediction || 'Unknown Food',
           confidence: result.confidence,
           calories: result.calories,
-          imageUrl: image || undefined,
+          imageUrl: image || '',
           cachedAt: new Date().toISOString()
         });
       }
@@ -123,10 +147,13 @@ export default function Classify() {
         message: t('error_classify_retry'),
         details: err
       });
+      if (announcement) announcement.textContent = t('error_classify_retry');
       console.error('Classification error:', err);
     } finally {
       setLoading(false);
-      setUploadProgress(0);
+      // Keep progress at 100 for a moment before resetting
+      setUploadProgress(100);
+      setTimeout(() => setUploadProgress(0), 1000);
     }
   };
 
@@ -191,13 +218,16 @@ export default function Classify() {
           <ImageUpload
             onImageSelect={(file, imageUrl) => {
               setImage(imageUrl);
+              setImageFile(file);
               setError(null);
               setClassification(null);
             }}
             onError={setError}
-            loading={false}
-            disabled={false}
+            loading={loading}
+            disabled={loading}
+            uploadProgress={uploadProgress}
           />
+        )}
 
         {error && (
           <div className="w-full mb-6 sm:mb-8 mt-4 max-w-md animate-shake px-2">
@@ -263,31 +293,7 @@ export default function Classify() {
                 </button>
 
                 {classification && (
-                  <div className="p-8 bg-white dark:bg-gray-800/80 backdrop-blur-md rounded-[2rem] shadow-2xl border border-emerald-100/50 dark:border-emerald-900/20 animate-scale-in">
-                    <h3 className="text-2xl font-black text-gray-900 dark:text-white mb-6 flex items-center gap-3">
-                      <div className="w-8 h-8 bg-emerald-500 rounded-full flex items-center justify-center text-white text-sm">✓</div>
-                      {t('classification_result')}
-                    </h3>
-                    <div className="space-y-6">
-                      <div className="bg-emerald-50/50 dark:bg-emerald-900/10 p-6 rounded-3xl flex justify-between items-center border border-emerald-100/30 dark:border-emerald-800/20">
-                        <div>
-                          <p className="text-[10px] text-emerald-600 dark:text-emerald-400 font-black uppercase tracking-[0.2em] mb-1">{t("result_label", "Prediction")}</p>
-                          <p className="text-3xl font-black text-indigo-900 dark:text-indigo-100">{classification.food}</p>
-                        </div>
-                        <div className="text-right">
-                          <p className="text-[10px] text-emerald-600 dark:text-emerald-400 font-black uppercase tracking-[0.2em] mb-1">{t("result_confidence", "Confidence")}</p>
-                          <p className="text-3xl font-black text-emerald-600 dark:text-emerald-400">{(classification.confidence * 100).toFixed(1)}%</p>
-                        </div>
-                      </div>
-                      {classification.calories && (
-                        <div className="text-center p-4 bg-orange-50/50 dark:bg-orange-900/10 rounded-2xl border border-orange-100/30 dark:border-orange-800/20">
-                          <p className="text-sm text-gray-600 dark:text-gray-400 font-bold">
-                            🔥 {t("estimated_calories", "Estimated Calories")}: <span className="text-orange-600 dark:text-orange-400 font-black text-xl ml-1">{classification.calories} kcal</span>
-                          </p>
-                        </div>
-                      )}
-                    </div>
-                  </div>
+                  <ClassificationResultComponent result={classification} loading={loading} />
                 )}
               </div>
               </div>
@@ -351,7 +357,7 @@ export default function Classify() {
           </div>
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
-            {history.map((entry) => (
+            {history.map((entry: HistoryEntry) => (
               <div
                 key={entry.id}
                 className="bg-white dark:bg-gray-800 p-6 rounded-[2rem] shadow-xl border border-gray-50 dark:border-gray-700/50 hover:shadow-2xl hover:-translate-y-2 transition-all duration-300 group"
@@ -365,7 +371,9 @@ export default function Classify() {
                     <span className="text-emerald-600 dark:text-emerald-400 font-black text-xs">{(entry.confidence * 100).toFixed(0)}%</span>
                   </div>
                 </div>
-                <h4 className="text-2xl font-black text-gray-900 dark:text-white capitalize mb-2 line-clamp-1 group-hover:text-indigo-600 dark:group-hover:text-indigo-400 transition-colors">{entry.food}</h4>
+                <h4 className="text-2xl font-black text-gray-900 dark:text-white capitalize mb-2 line-clamp-1 group-hover:text-indigo-600 dark:group-hover:text-indigo-400 transition-colors">
+                  {entry.food || entry.prediction}
+                </h4>
                 {entry.calories && (
                   <p className="text-sm text-gray-400 dark:text-gray-500 font-bold flex items-center gap-1.5">
                     <span className="text-orange-500">🔥</span> {entry.calories} kcal
