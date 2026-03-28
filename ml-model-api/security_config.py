@@ -4,12 +4,21 @@ Security configuration and middleware for FlavorSnap API
 import os
 import bleach
 import re
-from typing import Dict, Any, Optional
+try:
+    import magic
+    MAGIC_AVAILABLE = True
+except ImportError:
+    MAGIC_AVAILABLE = False
+    print("Warning: python-magic not available. Using fallback MIME detection.")
+import hashlib
+from typing import Dict, Any, Optional, Tuple, List
 from flask import request, abort
 from werkzeug.utils import secure_filename
-import hashlib
 import hmac
 from datetime import datetime, timedelta
+import logging
+from PIL import Image
+import io
 
 class SecurityConfig:
     """Security configuration class"""
@@ -56,6 +65,17 @@ class SecurityConfig:
         'image/gif',
         'image/webp'
     }
+    # Malicious file signatures
+    MALICIOUS_SIGNATURES = {
+        b'\x4D\x5A',  # PE executable
+        b'\x7FELF',   # ELF executable
+        b'\xCA\xFE\xBA\xBE',  # Java class
+        b'\xD0\xCF\x11\xE0',  # Microsoft Office
+        b'PK\x03\x04',  # ZIP (could contain malicious content)
+    }
+    # Image validation thresholds
+    MAX_IMAGE_DIMENSION = 8192
+    MIN_IMAGE_DIMENSION = 32
     
     # Input validation patterns
     PATTERNS = {
@@ -117,7 +137,7 @@ class InputValidator:
     
     @staticmethod
     def validate_file_upload(file) -> tuple[bool, Optional[str]]:
-        """Validate uploaded file"""
+        """Comprehensive file validation with security checks"""
         if not file:
             return False, "No file provided"
         
@@ -128,19 +148,122 @@ class InputValidator:
         if not InputValidator.validate_filename(file.filename):
             return False, "Invalid filename"
         
-        # Validate MIME type
-        if file.content_type not in SecurityConfig.ALLOWED_MIME_TYPES:
-            return False, f"Unsupported file type: {file.content_type}"
-        
-        # Check file size
+        # Check file size first
         file.seek(0, os.SEEK_END)
         file_size = file.tell()
         file.seek(0)
         
         if file_size > SecurityConfig.MAX_CONTENT_LENGTH:
-            return False, f"File too large. Max size: {SecurityConfig.MAX_CONTENT_LENGTH} bytes"
+            return False, f"File too large. Max size: {SecurityConfig.MAX_CONTENT_LENGTH // (1024*1024)}MB"
+        
+        if file_size == 0:
+            return False, "File is empty"
+        
+        # Read file content for validation
+        file_content = file.read()
+        file.seek(0)
+        
+        # Check for malicious file signatures
+        is_malicious, malicious_msg = InputValidator._check_malicious_signatures(file_content)
+        if is_malicious:
+            return False, f"Malicious file detected: {malicious_msg}"
+        
+        # Validate MIME type using python-magic or fallback
+        try:
+            if MAGIC_AVAILABLE:
+                detected_mime = magic.from_buffer(file_content, mime=True)
+            else:
+                # Fallback: use PIL to detect image format
+                try:
+                    image = Image.open(io.BytesIO(file_content))
+                    format_to_mime = {
+                        'JPEG': 'image/jpeg',
+                        'PNG': 'image/png',
+                        'GIF': 'image/gif',
+                        'WEBP': 'image/webp'
+                    }
+                    detected_mime = format_to_mime.get(image.format, 'application/octet-stream')
+                except:
+                    detected_mime = file.content_type or 'application/octet-stream'
+            
+            if detected_mime not in SecurityConfig.ALLOWED_MIME_TYPES:
+                return False, f"Unsupported file type detected: {detected_mime}"
+        except Exception as e:
+            logging.warning(f"MIME type detection failed: {e}")
+            # Fallback to content-type header
+            if file.content_type not in SecurityConfig.ALLOWED_MIME_TYPES:
+                return False, f"Unsupported file type: {file.content_type}"
+        
+        # Validate image content
+        is_valid_image, image_msg = InputValidator._validate_image_content(file_content)
+        if not is_valid_image:
+            return False, f"Invalid image: {image_msg}"
         
         return True, None
+    
+    @staticmethod
+    def _check_malicious_signatures(file_content: bytes) -> Tuple[bool, str]:
+        """Check for malicious file signatures"""
+        # Check file header for known malicious signatures
+        for signature, description in {
+            b'\x4D\x5A': 'PE executable',
+            b'\x7FELF': 'ELF executable', 
+            b'\xCA\xFE\xBA\xBE': 'Java class',
+            b'\xD0\xCF\x11\xE0': 'Microsoft Office',
+            b'PK\x03\x04': 'ZIP archive'
+        }.items():
+            if file_content.startswith(signature):
+                return True, description
+        
+        # Check for script content in image files
+        text_content = file_content.decode('utf-8', errors='ignore').lower()
+        script_patterns = [
+            '<script', 'javascript:', 'vbscript:', 
+            'onload=', 'onerror=', 'onclick=',
+            'eval(', 'document.', 'window.',
+            'php://', 'data://', 'file://'
+        ]
+        
+        for pattern in script_patterns:
+            if pattern in text_content:
+                return True, f'Script content detected: {pattern}'
+        
+        return False, ''
+    
+    @staticmethod
+    def _validate_image_content(file_content: bytes) -> Tuple[bool, str]:
+        """Validate image content using PIL"""
+        try:
+            # Open image with PIL
+            image = Image.open(io.BytesIO(file_content))
+            
+            # Verify image format
+            if image.format not in ['JPEG', 'PNG', 'GIF', 'WEBP']:
+                return False, f"Unsupported image format: {image.format}"
+            
+            # Check image dimensions
+            width, height = image.size
+            if width < SecurityConfig.MIN_IMAGE_DIMENSION or height < SecurityConfig.MIN_IMAGE_DIMENSION:
+                return False, f"Image too small: {width}x{height}"
+            
+            if width > SecurityConfig.MAX_IMAGE_DIMENSION or height > SecurityConfig.MAX_IMAGE_DIMENSION:
+                return False, f"Image too large: {width}x{height}"
+            
+            # Verify image can be loaded (detects corrupted files)
+            image.verify()
+            
+            # Re-open after verify (verify() closes the image)
+            image = Image.open(io.BytesIO(file_content))
+            
+            # Check for reasonable aspect ratio (to detect panorama attacks)
+            aspect_ratio = max(width, height) / min(width, height)
+            if aspect_ratio > 20:  # Very extreme aspect ratios
+                return False, f"Extreme aspect ratio: {aspect_ratio:.2f}"
+            
+            return True, ''
+            
+        except Exception as e:
+            return False, f"Image validation failed: {str(e)}"
     
     @staticmethod
     def secure_filename_custom(filename: str) -> str:

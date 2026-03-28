@@ -19,6 +19,10 @@ from security_config import (
 # Import performance monitoring
 from monitoring import MonitoringMiddleware, track_inference, update_model_accuracy
 
+# Import model validator
+from model_validator import ModelValidator, FileValidationResult
+from model_registry import ModelRegistry
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -42,6 +46,15 @@ security_monitor = SecurityMonitor(app)
 
 # Initialize performance monitoring middleware
 monitoring_middleware = MonitoringMiddleware(app)
+
+# Initialize model registry and validator
+try:
+    model_registry = ModelRegistry()
+    model_validator = ModelValidator(model_registry)
+    logger.info("Model validator initialized successfully")
+except Exception as e:
+    logger.warning(f"Model validator initialization failed: {e}")
+    model_validator = None
 
 # Initialize rate limiter with tiered key function
 limiter = Limiter(
@@ -112,11 +125,38 @@ def predict():
         
         file = request.files['image']
         
-        # Validate file upload
+        # Enhanced file validation using security module
         is_valid, error_msg = InputValidator.validate_file_upload(file)
         if not is_valid:
             logger.warning(f"File validation failed: {error_msg}")
-            return jsonify({'error': error_msg}), 400
+            return jsonify({
+                'error': error_msg,
+                'error_type': 'validation_failed',
+                'timestamp': datetime.now().isoformat()
+            }), 400
+        
+        # Additional validation using model validator if available
+        if model_validator:
+            try:
+                validation_result = model_validator.validate_uploaded_file(file)
+                if not validation_result.is_valid:
+                    logger.warning(f"Model validator failed: {validation_result.validation_errors}")
+                    return jsonify({
+                        'error': 'File validation failed',
+                        'details': validation_result.validation_errors,
+                        'error_type': 'security_validation_failed',
+                        'timestamp': datetime.now().isoformat()
+                    }), 400
+                
+                # Log validation details for monitoring
+                logger.info(f"File validated successfully: {validation_result.filename}, "
+                           f"size: {validation_result.file_size}, "
+                           f"mime: {validation_result.detected_mime_type}, "
+                           f"dimensions: {validation_result.image_dimensions}")
+                           
+            except Exception as e:
+                logger.error(f"Model validator error: {str(e)}")
+                # Continue with basic validation if model validator fails
         
         # Generate secure filename
         filename = InputValidator.secure_filename_custom(file.filename)
@@ -131,11 +171,118 @@ def predict():
             'confidence': 0.95,
             'processing_time': processing_time,
             'timestamp': datetime.now().isoformat(),
-            'request_id': request.headers.get('X-Request-ID', 'unknown')
+            'request_id': request.headers.get('X-Request-ID', 'unknown'),
+            'file_info': {
+                'filename': filename,
+                'size': file.tell() if hasattr(file, 'tell') else 'unknown'
+            }
         })
         
     except Exception as e:
         logger.error(f"Prediction error: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+# File validation endpoint for testing and monitoring
+@app.route('/validate-file', methods=['POST'])
+@tiered_rate_limit('upload')
+@require_api_key
+def validate_file():
+    """Dedicated file validation endpoint"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file provided'}), 400
+        
+        file = request.files['file']
+        
+        if not model_validator:
+            # Fallback to basic security validation
+            is_valid, error_msg = InputValidator.validate_file_upload(file)
+            return jsonify({
+                'is_valid': is_valid,
+                'error': error_msg if not is_valid else None,
+                'validation_type': 'basic_security'
+            })
+        
+        # Comprehensive validation
+        validation_result = model_validator.validate_uploaded_file(file)
+        
+        response = {
+            'is_valid': validation_result.is_valid,
+            'filename': validation_result.filename,
+            'file_size': validation_result.file_size,
+            'detected_mime_type': validation_result.detected_mime_type,
+            'image_dimensions': validation_result.image_dimensions,
+            'file_hash': validation_result.file_hash,
+            'validation_errors': validation_result.validation_errors,
+            'security_flags': validation_result.security_flags,
+            'validation_type': 'comprehensive',
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        # Log validation results
+        if validation_result.is_valid:
+            logger.info(f"File validation successful: {validation_result.filename}")
+        else:
+            logger.warning(f"File validation failed: {validation_result.filename}, "
+                          f"errors: {validation_result.validation_errors}")
+        
+        return jsonify(response)
+        
+    except Exception as e:
+        logger.error(f"File validation error: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+# Batch file validation endpoint
+@app.route('/validate-files', methods=['POST'])
+@tiered_rate_limit('upload')
+@require_api_key
+def validate_files():
+    """Batch file validation endpoint"""
+    try:
+        if not model_validator:
+            return jsonify({'error': 'Batch validation not available'}), 503
+        
+        files = request.files.getlist('files')
+        if not files:
+            return jsonify({'error': 'No files provided'}), 400
+        
+        # Prepare file list for batch validation
+        file_list = [(file, file.filename) for file in files]
+        
+        # Perform batch validation
+        validation_results = model_validator.batch_validate_files(file_list)
+        
+        # Get summary statistics
+        summary = model_validator.get_validation_summary(validation_results)
+        
+        # Convert results to dict for JSON serialization
+        results_dict = []
+        for result in validation_results:
+            results_dict.append({
+                'filename': result.filename,
+                'is_valid': result.is_valid,
+                'file_size': result.file_size,
+                'detected_mime_type': result.detected_mime_type,
+                'image_dimensions': result.image_dimensions,
+                'file_hash': result.file_hash,
+                'validation_errors': result.validation_errors,
+                'security_flags': result.security_flags
+            })
+        
+        response = {
+            'results': results_dict,
+            'summary': summary,
+            'validation_type': 'batch_comprehensive',
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"Batch validation completed: {summary['total_files']} files, "
+                   f"{summary['valid_files']} valid, {summary['security_issues']} security issues")
+        
+        return jsonify(response)
+        
+    except Exception as e:
+        logger.error(f"Batch file validation error: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
 
 # Health check endpoint (exempt from rate limiting)
@@ -235,6 +382,8 @@ def api_info():
         'version': '2.0.0',
         'endpoints': {
             'predict': 'POST /predict - Food classification',
+            'validate_file': 'POST /validate-file - Single file validation',
+            'validate_files': 'POST /validate-files - Batch file validation',
             'health': 'GET /health - Basic health check',
             'health_detailed': 'GET /health/detailed - Detailed health metrics',
             'health_database': 'GET /health/database - Database connectivity check',
