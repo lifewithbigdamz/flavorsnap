@@ -98,10 +98,24 @@ def predict():
     """Food classification endpoint"""
     start_time = time.time()
     try:
+        # Validate and sanitize JSON input if present
+        if request.is_json:
+            json_data = request.get_json()
+            is_valid, error_msg = validate_json_input(json_data)
+            if not is_valid:
+                logger.warning(f"JSON validation failed: {error_msg}")
+                return jsonify({'error': error_msg}), 400
+
+        # Validate file upload
         if 'image' not in request.files:
             return jsonify({'error': 'No image provided'}), 400
 
         file = request.files['image']
+
+        # Sanitize filename from form data
+        if file.filename:
+            file.filename = InputValidator.sanitize_filename(file.filename)
+
         is_valid, error_msg = InputValidator.validate_file_upload(file)
         if not is_valid:
             logger.warning(f"File validation failed: {error_msg}")
@@ -111,23 +125,32 @@ def predict():
         save_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(save_path)
 
+        # Sanitize any additional form data
+        prediction_params = {}
+        for key, value in request.form.items():
+            if key != 'image':  # Skip file field
+                sanitized_key = InputValidator.sanitize_string(key, max_length=100)
+                sanitized_value = InputValidator.sanitize_string(str(value), max_length=500)
+                if sanitized_key:
+                    prediction_params[sanitized_key] = sanitized_value
+
         # TODO: replace with actual model inference
         processing_time = time.time() - start_time
         logger.info(f"Prediction completed for {filename} in {processing_time:.3f}s")
+
+        # Sanitize request ID from headers
+        request_id = InputValidator.sanitize_string(
+            request.headers.get('X-Request-ID', 'unknown'),
+            max_length=64
+        )
 
         return jsonify({
             'prediction': 'Sample food',
             'confidence': 0.95,
             'processing_time': processing_time,
             'timestamp': datetime.now().isoformat(),
-            'request_id': request.headers.get('X-Request-ID', 'unknown')
-        })
-
-    except Exception as e:
-        logger.error(f"Prediction error: {str(e)}", exc_info=True)
-        return jsonify({'error': 'Internal server error'}), 500
-
-
+            'request_id': request_id,
+            'params': prediction_params
 @app.route('/health', methods=['GET'])
 @limiter.exempt
 def health_check():
