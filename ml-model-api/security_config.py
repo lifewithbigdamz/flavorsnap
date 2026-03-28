@@ -94,12 +94,128 @@ class InputValidator:
     """Input validation and sanitization utilities"""
 
     @staticmethod
-    def sanitize_string(text: str, max_length: int = 1000) -> str:
-        if not text:
+    def sanitize_string(text: str, max_length: int = 1000, allow_html: bool = False) -> str:
+        """Sanitize string input with comprehensive XSS protection"""
+        if not text or not isinstance(text, str):
             return ""
-        # Strip HTML tags with a simple regex (avoids bleach dependency)
-        cleaned = re.sub(r'<[^>]+>', '', text)
-        return cleaned[:max_length].strip()
+
+        # Remove null bytes and control characters
+        text = text.replace('\x00', '').replace('\r', '').replace('\n', ' ')
+
+        # Strip HTML tags if not allowed (basic XSS protection)
+        if not allow_html:
+            # More comprehensive HTML tag removal
+            text = re.sub(r'<[^>]+>', '', text)
+            # Remove script tags and their content
+            text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.IGNORECASE | re.DOTALL)
+            # Remove javascript: and other dangerous protocols
+            text = re.sub(r'(javascript|vbscript|data|file):', '', text, flags=re.IGNORECASE)
+
+        # Remove potential SQL injection patterns
+        text = re.sub(r'(\b(union|select|insert|update|delete|drop|create|alter|exec|execute)\b)', '', text, flags=re.IGNORECASE)
+
+        # Remove command injection patterns
+        text = re.sub(r'[;&|`$()<>]', '', text)
+
+        # Limit length
+        return text[:max_length].strip()
+
+    @staticmethod
+    def sanitize_json_input(data: Dict[str, Any], schema: Dict[str, Any] = None) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+        """Sanitize JSON input data with schema validation"""
+        if not isinstance(data, dict):
+            return False, "Invalid JSON format", {}
+
+        sanitized_data = {}
+
+        for key, value in data.items():
+            # Sanitize keys
+            clean_key = InputValidator.sanitize_string(str(key), max_length=100, allow_html=False)
+            if not clean_key:
+                continue
+
+            # Sanitize values based on type
+            if isinstance(value, str):
+                sanitized_data[clean_key] = InputValidator.sanitize_string(value, max_length=1000)
+            elif isinstance(value, (int, float)):
+                # Ensure numeric values are within reasonable bounds
+                if isinstance(value, int) and (-1000000 <= value <= 1000000):
+                    sanitized_data[clean_key] = value
+                elif isinstance(value, float) and (-1000000 <= value <= 1000000):
+                    sanitized_data[clean_key] = value
+            elif isinstance(value, bool):
+                sanitized_data[clean_key] = value
+            elif isinstance(value, list):
+                # Sanitize list items (limit to 100 items)
+                sanitized_list = []
+                for item in value[:100]:
+                    if isinstance(item, str):
+                        sanitized_list.append(InputValidator.sanitize_string(item, max_length=500))
+                    elif isinstance(item, (int, float, bool)):
+                        sanitized_list.append(item)
+                sanitized_data[clean_key] = sanitized_list
+            # Skip other types (dict, None, etc.) for security
+
+        # Schema validation if provided
+        if schema:
+            for required_field in schema.get('required', []):
+                if required_field not in sanitized_data:
+                    return False, f"Missing required field: {required_field}", sanitized_data
+
+            for field, field_schema in schema.get('properties', {}).items():
+                if field in sanitized_data:
+                    field_type = field_schema.get('type')
+                    if field_type == 'string' and not isinstance(sanitized_data[field], str):
+                        return False, f"Field {field} must be a string", sanitized_data
+                    elif field_type == 'number' and not isinstance(sanitized_data[field], (int, float)):
+                        return False, f"Field {field} must be a number", sanitized_data
+                    elif field_type == 'boolean' and not isinstance(sanitized_data[field], bool):
+                        return False, f"Field {field} must be a boolean", sanitized_data
+
+        return True, None, sanitized_data
+
+    @staticmethod
+    def sanitize_url(url: str) -> str:
+        """Sanitize URL input"""
+        if not url or not isinstance(url, str):
+            return ""
+
+        # Remove dangerous protocols
+        url = re.sub(r'(javascript|vbscript|data|file):', '', url, flags=re.IGNORECASE)
+
+        # Basic URL validation
+        if not re.match(r'^https?://', url):
+            return ""
+
+        # Limit length
+        return url[:2000]
+
+    @staticmethod
+    def sanitize_email(email: str) -> str:
+        """Sanitize email input"""
+        if not email or not isinstance(email, str):
+            return ""
+
+        # Basic email pattern validation
+        if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
+            return ""
+
+        return email[:254].lower()  # RFC 5321 limit
+
+    @staticmethod
+    def sanitize_filename(filename: str) -> str:
+        """Sanitize filename input"""
+        if not filename or not isinstance(filename, str):
+            return ""
+
+        # Remove path traversal attempts
+        filename = os.path.basename(filename)
+
+        # Remove dangerous characters
+        filename = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', filename)
+
+        # Limit length
+        return filename[:255]
 
     @staticmethod
     def validate_filename(filename: str) -> bool:
@@ -461,11 +577,17 @@ def is_safe_url(url: str) -> bool:
     return True
 
 
-def validate_json_input(data: Dict[str, Any], required_fields: list = None) -> Tuple[bool, Optional[str]]:
-    if not isinstance(data, dict):
-        return False, "Invalid JSON format"
+def validate_json_input(data: Dict[str, Any], required_fields: list = None, schema: Dict[str, Any] = None) -> Tuple[bool, Optional[str]]:
+    """Validate and sanitize JSON input data"""
+    is_valid, error_msg, sanitized_data = InputValidator.sanitize_json_input(data, schema)
+
+    if not is_valid:
+        return False, error_msg
+
+    # Check required fields
     if required_fields:
-        missing = [f for f in required_fields if f not in data]
+        missing = [f for f in required_fields if f not in sanitized_data]
         if missing:
             return False, f"Missing required fields: {', '.join(missing)}"
+
     return True, None
