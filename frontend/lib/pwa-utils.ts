@@ -12,11 +12,48 @@ export interface PushSubscriptionOptions {
   applicationServerKey?: ArrayBuffer | string;
 }
 
+export interface PerformanceMetrics {
+  cacheHits: number;
+  cacheMisses: number;
+  networkRequests: number;
+  offlineRequests: number;
+  averageResponseTime: number;
+  totalResponseTime: number;
+  requestCount: number;
+}
+
+export interface OfflineAnalytics {
+  type: string;
+  timestamp: number;
+  data?: any;
+}
+
+export interface CacheStrategy {
+  name: string;
+  pattern: RegExp;
+  strategy: 'cache-first' | 'network-first' | 'stale-while-revalidate';
+  maxAge: number;
+  maxEntries: number;
+}
+
 export class PWAManager {
   private static instance: PWAManager;
   private deferredPrompt: BeforeInstallPromptEvent | null = null;
   private swRegistration: ServiceWorkerRegistration | null = null;
   private isInstalled: boolean = false;
+  private isOnline: boolean = navigator.onLine;
+  private performanceMetrics: PerformanceMetrics = {
+    cacheHits: 0,
+    cacheMisses: 0,
+    networkRequests: 0,
+    offlineRequests: 0,
+    averageResponseTime: 0,
+    totalResponseTime: 0,
+    requestCount: 0
+  };
+  private offlineAnalytics: OfflineAnalytics[] = [];
+  private cacheStrategies: CacheStrategy[] = [];
+  private messageChannel: MessageChannel | null = null;
 
   static getInstance(): PWAManager {
     if (!PWAManager.instance) {
@@ -28,6 +65,9 @@ export class PWAManager {
   private constructor() {
     this.initializeServiceWorker();
     this.setupInstallPrompt();
+    this.setupNetworkListeners();
+    this.setupMessageChannel();
+    this.initializeCacheStrategies();
   }
 
   private async initializeServiceWorker() {
@@ -316,6 +356,347 @@ export class PWAManager {
       isStandalone: this.isStandalone(),
       canInstall: this.canInstall()
     };
+  }
+
+  // Advanced PWA features
+  private setupNetworkListeners(): void {
+    if (typeof window !== 'undefined') {
+      window.addEventListener('online', () => {
+        this.isOnline = true;
+        this.logOfflineAnalytics('network_status', { status: 'online' });
+        console.log('PWA: Network connection restored');
+      });
+
+      window.addEventListener('offline', () => {
+        this.isOnline = false;
+        this.logOfflineAnalytics('network_status', { status: 'offline' });
+        console.log('PWA: Network connection lost');
+      });
+    }
+  }
+
+  private setupMessageChannel(): void {
+    if (typeof window !== 'undefined' && 'serviceWorker' in navigator) {
+      this.messageChannel = new MessageChannel();
+      
+      this.messageChannel.port1.onmessage = (event) => {
+        this.handleServiceWorkerMessage(event.data);
+      };
+
+      navigator.serviceWorker.addEventListener('message', (event) => {
+        this.handleServiceWorkerMessage(event.data);
+      });
+    }
+  }
+
+  private handleServiceWorkerMessage(data: any): void {
+    switch (data.type) {
+      case 'SW_UPDATED':
+        console.log('PWA: Service Worker updated');
+        this.notifyUser('App Updated', 'A new version is available. Refresh to see changes.');
+        break;
+      case 'online':
+        this.isOnline = true;
+        console.log('PWA: Back online');
+        break;
+      case 'offline':
+        this.isOnline = false;
+        console.log('PWA: Gone offline');
+        break;
+      case 'sync-success':
+        console.log('PWA: Background sync successful', data.data);
+        break;
+      case 'classification-complete':
+        console.log('PWA: Classification completed', data.data);
+        break;
+      default:
+        console.log('PWA: Unknown message from service worker', data);
+    }
+  }
+
+  private initializeCacheStrategies(): void {
+    this.cacheStrategies = [
+      {
+        name: 'static-assets',
+        pattern: /\.(css|js|png|jpg|jpeg|gif|webp|svg|woff|woff2)$/i,
+        strategy: 'cache-first',
+        maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+        maxEntries: 100
+      },
+      {
+        name: 'api-calls',
+        pattern: /\/api\//i,
+        strategy: 'network-first',
+        maxAge: 5 * 60 * 1000, // 5 minutes
+        maxEntries: 50
+      },
+      {
+        name: 'images',
+        pattern: /\.(jpg|jpeg|png|gif|webp)$/i,
+        strategy: 'stale-while-revalidate',
+        maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+        maxEntries: 200
+      }
+    ];
+  }
+
+  // Performance monitoring
+  getPerformanceMetrics(): PerformanceMetrics {
+    return { ...this.performanceMetrics };
+  }
+
+  async getPerformanceMetricsFromSW(): Promise<PerformanceMetrics | null> {
+    if (!this.swRegistration) return null;
+
+    try {
+      const messageChannel = new MessageChannel();
+      
+      return new Promise((resolve) => {
+        messageChannel.port1.onmessage = (event) => {
+          if (event.data.type === 'PERFORMANCE_METRICS') {
+            resolve(event.data.data);
+          } else {
+            resolve(null);
+          }
+        };
+
+        navigator.serviceWorker.controller?.postMessage(
+          { type: 'GET_PERFORMANCE_METRICS' },
+          [messageChannel.port2]
+        );
+      });
+    } catch (error) {
+      console.error('Error getting performance metrics from SW:', error);
+      return null;
+    }
+  }
+
+  // Cache management
+  async clearCache(): Promise<boolean> {
+    if (!this.swRegistration) return false;
+
+    try {
+      const messageChannel = new MessageChannel();
+      
+      return new Promise((resolve) => {
+        messageChannel.port1.onmessage = (event) => {
+          resolve(event.data.type === 'CACHE_CLEARED');
+        };
+
+        navigator.serviceWorker.controller?.postMessage(
+          { type: 'CLEAR_CACHE' },
+          [messageChannel.port2]
+        );
+      });
+    } catch (error) {
+      console.error('Error clearing cache:', error);
+      return false;
+    }
+  }
+
+  // Background sync
+  async forceBackgroundSync(): Promise<boolean> {
+    if (!this.swRegistration) return false;
+
+    try {
+      const messageChannel = new MessageChannel();
+      
+      return new Promise((resolve) => {
+        messageChannel.port1.onmessage = (event) => {
+          resolve(event.data.type === 'SYNC_COMPLETED');
+        };
+
+        navigator.serviceWorker.controller?.postMessage(
+          { type: 'FORCE_SYNC' },
+          [messageChannel.port2]
+        );
+      });
+    } catch (error) {
+      console.error('Error forcing background sync:', error);
+      return false;
+    }
+  }
+
+  // Offline analytics
+  private logOfflineAnalytics(type: string, data?: any): void {
+    this.offlineAnalytics.push({
+      type,
+      timestamp: Date.now(),
+      data
+    });
+
+    // Keep only last 1000 entries
+    if (this.offlineAnalytics.length > 1000) {
+      this.offlineAnalytics = this.offlineAnalytics.slice(-1000);
+    }
+  }
+
+  getOfflineAnalytics(): OfflineAnalytics[] {
+    return [...this.offlineAnalytics];
+  }
+
+  // Advanced notification features
+  async scheduleNotification(
+    title: string,
+    options: NotificationOptions & { scheduledTime?: number } = {}
+  ): Promise<void> {
+    const { scheduledTime, ...notificationOptions } = options;
+
+    if (scheduledTime && scheduledTime > Date.now()) {
+      const delay = scheduledTime - Date.now();
+      setTimeout(() => {
+        this.showLocalNotification(title, notificationOptions);
+      }, delay);
+    } else {
+      await this.showLocalNotification(title, notificationOptions);
+    }
+  }
+
+  // Cross-browser compatibility
+  detectBrowserCapabilities(): {
+    serviceWorker: boolean;
+    pushNotifications: boolean;
+    backgroundSync: boolean;
+    periodicSync: boolean;
+    notifications: boolean;
+    installPrompt: boolean;
+    standaloneMode: boolean;
+  } {
+    return {
+      serviceWorker: 'serviceWorker' in navigator,
+      pushNotifications: 'PushManager' in window && 'Notification' in window,
+      backgroundSync: 'serviceWorker' in navigator && 'sync' in ServiceWorkerRegistration.prototype,
+      periodicSync: 'serviceWorker' in navigator && 'periodicSync' in ServiceWorkerRegistration.prototype,
+      notifications: 'Notification' in window,
+      installPrompt: 'beforeinstallprompt' in window,
+      standaloneMode: this.isStandalone()
+    };
+  }
+
+  // Network status
+  getNetworkStatus(): {
+    isOnline: boolean;
+    connectionType?: string;
+    effectiveType?: string;
+    downlink?: number;
+    rtt?: number;
+  } {
+    const connection = (navigator as any).connection || (navigator as any).mozConnection || (navigator as any).webkitConnection;
+    
+    return {
+      isOnline: this.isOnline,
+      connectionType: connection?.type,
+      effectiveType: connection?.effectiveType,
+      downlink: connection?.downlink,
+      rtt: connection?.rtt
+    };
+  }
+
+  // Storage management
+  async getStorageUsage(): Promise<{
+    quota: number;
+    usage: number;
+    usageDetails: any;
+  }> {
+    if ('storage' in navigator && 'estimate' in navigator.storage) {
+      try {
+        const estimate = await navigator.storage.estimate();
+        return {
+          quota: estimate.quota || 0,
+          usage: estimate.usage || 0,
+          usageDetails: (estimate as any).usageDetails || {}
+        };
+      } catch (error) {
+        console.error('Error getting storage usage:', error);
+      }
+    }
+    
+    return { quota: 0, usage: 0, usageDetails: {} };
+  }
+
+  async requestPersistentStorage(): Promise<boolean> {
+    if ('storage' in navigator && 'persist' in navigator.storage) {
+      try {
+        const isPersistent = await navigator.storage.persist();
+        console.log('Persistent storage granted:', isPersistent);
+        return isPersistent;
+      } catch (error) {
+        console.error('Error requesting persistent storage:', error);
+      }
+    }
+    return false;
+  }
+
+  // User engagement tracking
+  trackUserEngagement(action: string, data?: any): void {
+    this.logOfflineAnalytics('user_engagement', { action, data });
+  }
+
+  // App lifecycle
+  getAppVisibilityState(): 'visible' | 'hidden' {
+    if (typeof document !== 'undefined') {
+      return document.visibilityState as 'visible' | 'hidden';
+    }
+    return 'visible';
+  }
+
+  setupVisibilityChangeListener(callback: (isVisible: boolean) => void): () => void {
+    if (typeof document !== 'undefined') {
+      const handleVisibilityChange = () => {
+        callback(document.visibilityState === 'visible');
+      };
+
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+
+      // Return cleanup function
+      return () => {
+        document.removeEventListener('visibilitychange', handleVisibilityChange);
+      };
+    }
+    return () => {};
+  }
+
+  // Advanced install features
+  async checkInstallEligibility(): Promise<{
+    eligible: boolean;
+    reasons: string[];
+    recommendations: string[];
+  }> {
+    const capabilities = this.detectBrowserCapabilities();
+    const reasons: string[] = [];
+    const recommendations: string[] = [];
+
+    if (!capabilities.serviceWorker) {
+      reasons.push('Service Worker not supported');
+      recommendations.push('Use a modern browser that supports Service Workers');
+    }
+
+    if (!capabilities.installPrompt) {
+      reasons.push('Install prompt not supported');
+      recommendations.push('Try installing from the browser menu');
+    }
+
+    if (this.isInstalled) {
+      reasons.push('Already installed');
+      recommendations.push('App is already installed');
+    }
+
+    const eligible = reasons.length === 0 && this.canInstall();
+
+    return {
+      eligible,
+      reasons,
+      recommendations
+    };
+  }
+
+  // Custom notifications
+  private notifyUser(title: string, message: string): void {
+    // You can implement a custom notification UI here
+    console.log('PWA Notification:', title, message);
+    
+    // Also show as system notification if permitted
+    this.showLocalNotification(title, { body: message });
   }
 }
 
