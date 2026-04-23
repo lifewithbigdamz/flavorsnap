@@ -53,6 +53,25 @@ const nextConfig: NextConfig = {
   reactStrictMode: true,
   i18n,
   
+  // Image optimization for SEO and performance
+  images: {
+    formats: ['image/webp', 'image/avif'],
+    deviceSizes: [640, 750, 828, 1080, 1200, 1920, 2048, 3840],
+    imageSizes: [16, 32, 48, 64, 96, 128, 256, 384],
+    minimumCacheTTL: 60 * 60 * 24 * 30, // 30 days
+    dangerouslyAllowSVG: true,
+    contentSecurityPolicy: "default-src 'self'; script-src 'none'; sandbox;",
+  },
+  
+  // Compression for better performance
+  compress: true,
+  
+  // Power by headers for SEO
+  poweredByHeader: false,
+  
+  // Generate ETags for caching
+  generateEtags: true,
+  
   // Security headers and CSP
   async headers() {
     const nonce = generateNonce();
@@ -100,6 +119,15 @@ const nextConfig: NextConfig = {
           {
             key: 'Strict-Transport-Security',
             value: 'max-age=31536000; includeSubDomains; preload'
+          },
+          // SEO and performance headers
+          {
+            key: 'Cache-Control',
+            value: 'public, max-age=31536000, immutable'
+          },
+          {
+            key: 'X-DNS-Prefetch-Control',
+            value: 'on'
           }
         ]
       },
@@ -110,19 +138,70 @@ const nextConfig: NextConfig = {
           {
             key: 'Content-Security-Policy',
             value: "default-src 'self'; script-src 'self'; style-src 'self';"
+          },
+          {
+            key: 'Cache-Control',
+            value: 'public, max-age=3600, must-revalidate'
+          }
+        ]
+      },
+      {
+        // Static assets with long cache
+        source: '/_next/static/(.*)',
+        headers: [
+          {
+            key: 'Cache-Control',
+            value: 'public, max-age=31536000, immutable'
+          }
+        ]
+      },
+      {
+        // Images with optimized caching
+        source: '/images/(.*)',
+        headers: [
+          {
+            key: 'Cache-Control',
+            value: 'public, max-age=2592000, must-revalidate'
           }
         ]
       }
     ];
   },
   
-  // Environment variables for nonce (passed to client)
-  env: {
-    CSP_NONCE: generateNonce()
+  // Redirects for SEO
+  async redirects() {
+    return [
+      {
+        source: '/home',
+        destination: '/',
+        permanent: true,
+      },
+      {
+        source: '/index.html',
+        destination: '/',
+        permanent: true,
+      },
+      {
+        source: '/classify-food',
+        destination: '/classify',
+        permanent: true,
+      },
+      {
+        source: '/food-history',
+        destination: '/history',
+        permanent: true,
+      },
+    ];
   },
   
-  // Webpack configuration to pass nonce to client
-  webpack: (config, { isServer }) => {
+  // Environment variables for nonce (passed to client)
+  env: {
+    CSP_NONCE: generateNonce(),
+    NEXT_PUBLIC_SITE_URL: process.env.NEXT_PUBLIC_SITE_URL || 'https://flavorsnap.com',
+  },
+  
+  // Webpack configuration for performance optimization
+  webpack: (config, { isServer, dev }) => {
     if (!isServer) {
       config.plugins.push(
         new config.webpack.DefinePlugin({
@@ -130,8 +209,38 @@ const nextConfig: NextConfig = {
         })
       );
     }
+    
+    // Optimize for production
+    if (!dev) {
+      config.optimization = {
+        ...config.optimization,
+        splitChunks: {
+          chunks: 'all',
+          cacheGroups: {
+            vendor: {
+              test: /[\\/]node_modules[\\/]/,
+              name: 'vendors',
+              chunks: 'all',
+            },
+            common: {
+              name: 'common',
+              minChunks: 2,
+              chunks: 'all',
+              enforce: true,
+            },
+          },
+        },
+      };
+    }
+    
     return config;
-  }
+  },
+
+  // Experimental features for better performance
+  experimental: {
+    optimizeCss: true,
+    optimizePackageImports: ['lucide-react', 'recharts'],
+  },
 
 };
 
