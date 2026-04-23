@@ -89,11 +89,14 @@ flavorsnap/
 | Document | Purpose |
 |----------|---------|
 | **[Project Structure](docs/project_structure.md)** | Complete directory structure and organization |
+| **[Blockchain Architecture](docs/blockchain.md)** | Decentralized governance and incentive design |
+| **[Smart Contracts](contracts/README.md)** | Technical documentation for developer and user interactions |
 | **[Development Workflow](docs/development_workflow.md)** | Development process and guidelines |
 | **[File Purposes](docs/file_purposes.md)** | Detailed file responsibilities |
 | **[Installation Guide](docs/installation.md)** | Comprehensive setup instructions |
 | **[Configuration Guide](docs/configuration.md)** | Configuration options and settings |
 | **[Troubleshooting Guide](docs/troubleshooting.md)** | Common issues and solutions |
+| **[Blockchain Integration](docs/blockchain.md)** | Role of Stellar and Soroban in the ecosystem |
 
 ### Development Tools
 
@@ -948,32 +951,32 @@ npm run test
 npm run test:coverage
 npm run test:e2e
 
-# Backend tests
-cd ml-model-api
-python -m pytest
-python -m pytest --cov=app
+# Backend (FastAPI API + Panel UI) tests
+# Runs only tests under `tests/` (see repo `pyproject.toml`).
+python scripts/run_tests.py
 
-# Integration tests
-npm run test:integration
+# Same suite with coverage (enforces 90%+).
+python scripts/coverage_report.py
+
+# Performance benchmarks
+python scripts/run_tests.py --performance-smoke
+python scripts/run_tests.py --performance-full
 ```
 
 ### Test Structure
 
 ```
 tests/
-├── 📁 frontend/
-│   ├── 📁 components/          # Component tests
-│   ├── 📁 pages/              # Page tests
-│   └── 📁 utils/              # Utility tests
-├── 📁 backend/
-│   ├── 📁 api/                # API endpoint tests
-│   └── 📁 model/              # Model tests
-└── 📁 e2e/                    # End-to-end tests
+├── 📁 api/                    # FastAPI endpoint tests (existing)
+├── 📁 unit/                   # Core module unit tests
+├── 📁 integration/            # API/UI integration tests
+└── 📁 performance/           # pytest-benchmark performance checks
 ```
 
 ### Test Data
 
-Test images are available in `tests/fixtures/images/` with proper labels for validation.
+Most Python fixtures are generated deterministically at runtime (see `tests/conftest.py`).
+Any on-disk lightweight assets live under `tests/fixtures/`.
 
 ## 📊 Model Information
 
