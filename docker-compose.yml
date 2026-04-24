@@ -1,18 +1,41 @@
 version: '3.8'
 
 services:
-
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    ports:
+      - "3000:3000"
     depends_on:
       - backend
     networks:
       - flavorsnap-network
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:5000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
 
+  backend:
+    build:
+      context: ./ml-model-api
+      dockerfile: Dockerfile.dev
+    ports:
+      - "5000:5000"
+    networks:
+      - flavorsnap-network
+    environment:
+      - FLASK_ENV=development
+      - MODEL_PATH=/app/model.pth
+    volumes:
+      - ./ml-model-api:/app
+      - ./model.pth:/app/model.pth
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-
 
 networks:
   flavorsnap-network:

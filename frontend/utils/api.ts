@@ -301,7 +301,7 @@ setInterval(cleanExpiredCache, 5 * 60 * 1000); // Every 5 minutes
 const apiRequest = async <T = any>(
   url: string,
   options: ApiOptions = {},
-  onProgress?: (progress: number) => void, // Progress callback
+  onProgress?: (progress: number, status?: string) => void, // Progress callback with status
 ): Promise<ApiResponse<T>> => {
   const { retries = 3, retryDelay = 1000, skipCache = false, ...fetchOptions } = options;
 
@@ -319,6 +319,7 @@ const apiRequest = async <T = any>(
         // Check for cached response
         const cachedResponse = getCachedResponse<T>(cacheKey);
         if (cachedResponse) {
+          if (onProgress) onProgress(100, 'cached');
           return cachedResponse;
         }
       }
@@ -393,15 +394,20 @@ const apiRequest = async <T = any>(
           });
 
           // Progress tracking
+          xhr.upload.addEventListener('loadstart', () => {
+            onProgress(0, 'starting');
+          });
+
           xhr.upload.addEventListener('progress', (e) => {
             if (e.lengthComputable && onProgress) {
               const progress = Math.round((e.loaded / e.total) * 100);
-              onProgress(progress);
+              onProgress(progress, progress < 100 ? 'uploading' : 'processing');
             }
           });
 
           xhr.onload = () => {
             if (xhr.status >= 200 && xhr.status < 300) {
+              onProgress(100, 'complete');
               try {
                 const data = JSON.parse(xhr.responseText);
 
@@ -441,6 +447,24 @@ const apiRequest = async <T = any>(
         });
       }
 
+      // If it's not FormData but onProgress is provided, simulate a slow progress
+      // for better UX during JSON/fetch requests
+      let progressInterval: NodeJS.Timeout | null = null;
+      if (!isFormData && onProgress) {
+        let currentProgress = 0;
+        onProgress(0, 'starting');
+        progressInterval = setInterval(() => {
+          currentProgress += Math.random() * 15;
+          if (currentProgress > 95) {
+            if (progressInterval) clearInterval(progressInterval);
+            currentProgress = 95;
+            onProgress(95, 'processing');
+          } else {
+            onProgress(Math.round(currentProgress), 'loading');
+          }
+        }, 300);
+      }
+
       const response = await fetch(sanitizedUrl, {
         ...fetchOptions,
         body: sanitizedBody,
@@ -449,6 +473,11 @@ const apiRequest = async <T = any>(
           ...(fetchOptions.headers as Record<string, string>),
         },
       });
+
+      if (progressInterval) {
+        clearInterval(progressInterval);
+        if (onProgress) onProgress(100, 'complete');
+      }
 
       const data = await response.json().catch(() => null);
 
@@ -506,14 +535,14 @@ export const api = {
   get: <T = any>(url: string, options?: ApiOptions) =>
     apiRequest<T>(url, { method: "GET", ...options }),
 
-  post: <T = any>(url: string, data?: any, options?: ApiOptions, onProgress?: (progress: number) => void) =>
+  post: <T = any>(url: string, data?: any, options?: ApiOptions, onProgress?: (progress: number, status?: string) => void) =>
     apiRequest<T>(url, {
       method: "POST",
       body: (typeof FormData !== "undefined" && data instanceof FormData) ? data : (data ? JSON.stringify(data) : undefined),
       ...options,
     }, onProgress),
 
-  put: <T = any>(url: string, data?: any, options?: ApiOptions, onProgress?: (progress: number) => void) =>
+  put: <T = any>(url: string, data?: any, options?: ApiOptions, onProgress?: (progress: number, status?: string) => void) =>
     apiRequest<T>(url, {
       method: "PUT",
       body: data ? JSON.stringify(data) : undefined,

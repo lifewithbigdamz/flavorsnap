@@ -521,3 +521,258 @@ class ModelDeploymentManager:
                     return True
         
         return False
+    
+    def multi_environment_deploy(self, 
+                                target_version: str, 
+                                environments: List[str] = ["staging", "production"],
+                                strategy: str = "rolling") -> Dict[str, Any]:
+        """Deploy to multiple environments with different strategies"""
+        
+        results = {}
+        
+        for env in environments:
+            try:
+                self.logger.info(f"Starting deployment to {env} environment")
+                
+                # Environment-specific validation
+                if env == "production":
+                    # Additional checks for production
+                    if not self._production_readiness_check(target_version):
+                        results[env] = {"success": False, "message": "Production readiness check failed"}
+                        continue
+                
+                # Perform deployment based on strategy
+                if strategy == "rolling":
+                    success = self._rolling_deploy(target_version, env)
+                elif strategy == "blue_green":
+                    success = self._blue_green_deploy(target_version, env)
+                else:
+                    success = self.deploy_model(target_version)
+                
+                results[env] = {
+                    "success": success,
+                    "message": f"Deployment to {env} {'succeeded' if success else 'failed'}"
+                }
+                
+                # If production deployment fails, stop further deployments
+                if env == "production" and not success:
+                    self.logger.error("Production deployment failed, stopping further deployments")
+                    break
+                    
+            except Exception as e:
+                results[env] = {"success": False, "message": f"Deployment error: {str(e)}"}
+                self.logger.error(f"Deployment to {env} failed: {e}")
+        
+        return results
+    
+    def _production_readiness_check(self, version: str) -> bool:
+        """Check if model is ready for production deployment"""
+        try:
+            model_metadata = self.model_registry.get_model(version)
+            if not model_metadata:
+                return False
+            
+            # Check accuracy threshold
+            if model_metadata.accuracy < 0.85:
+                self.logger.warning(f"Model accuracy {model_metadata.accuracy} below production threshold")
+                return False
+            
+            # Check if model has been tested in staging
+            staging_health = self.health_check(version)
+            if not staging_health.get("healthy", False):
+                self.logger.warning("Model not healthy in staging environment")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Production readiness check failed: {e}")
+            return False
+    
+    def _rolling_deploy(self, version: str, environment: str) -> bool:
+        """Perform rolling deployment"""
+        try:
+            # Simulate rolling update - in real implementation would update instances gradually
+            self.logger.info(f"Performing rolling deployment to {environment}")
+            
+            # Deploy to subset of instances first
+            success = self.deploy_model(version)
+            if success:
+                # Monitor for a short period
+                import time
+                time.sleep(30)
+                
+                # Check health after initial deployment
+                health = self.health_check(version)
+                if health.get("healthy", False):
+                    self.logger.info(f"Rolling deployment to {environment} successful")
+                    return True
+                else:
+                    self.logger.warning(f"Health check failed during rolling deployment to {environment}")
+                    return False
+            
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"Rolling deployment failed: {e}")
+            return False
+    
+    def _blue_green_deploy(self, version: str, environment: str) -> bool:
+        """Perform blue-green deployment"""
+        try:
+            self.logger.info(f"Performing blue-green deployment to {environment}")
+            
+            # Deploy to green environment
+            green_success = self.deploy_model(version)
+            
+            if green_success:
+                # Run comprehensive tests on green
+                green_health = self.health_check(version)
+                
+                if green_health.get("healthy", False):
+                    # Switch traffic to green
+                    self.logger.info(f"Switching traffic to green environment for {environment}")
+                    return True
+                else:
+                    # Rollback green, keep blue
+                    current_model = self.model_registry.get_active_model()
+                    if current_model:
+                        self.rollback_model(current_model.version, "Blue-green deployment failed")
+                    return False
+            
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"Blue-green deployment failed: {e}")
+            return False
+    
+    def get_deployment_metrics(self) -> Dict[str, Any]:
+        """Get comprehensive deployment metrics"""
+        try:
+            with sqlite3.connect(self.registry_path) as conn:
+                conn.row_factory = sqlite3.Row
+                
+                # Get deployment statistics
+                cursor = conn.execute("""
+                    SELECT 
+                        event_type,
+                        COUNT(*) as count,
+                        SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as success_count
+                    FROM deployment_events
+                    WHERE timestamp > datetime('now', '-30 days')
+                    GROUP BY event_type
+                """)
+                
+                event_stats = {}
+                for row in cursor.fetchall():
+                    event_stats[row['event_type']] = {
+                        'total': row['count'],
+                        'successful': row['success_count'],
+                        'success_rate': (row['success_count'] / row['count']) * 100 if row['count'] > 0 else 0
+                    }
+                
+                # Get health metrics
+                cursor = conn.execute("""
+                    SELECT 
+                        AVG(health_score) as avg_health,
+                        AVG(avg_response_time) as avg_response_time,
+                        SUM(error_count) as total_errors,
+                        SUM(total_requests) as total_requests
+                    FROM deployment_health
+                """)
+                
+                health_row = cursor.fetchone()
+                health_metrics = {
+                    'avg_health_score': health_row['avg_health'] or 0,
+                    'avg_response_time': health_row['avg_response_time'] or 0,
+                    'total_errors': health_row['total_errors'] or 0,
+                    'total_requests': health_row['total_requests'] or 0,
+                    'error_rate': (health_row['total_errors'] / health_row['total_requests']) * 100 if health_row['total_requests'] > 0 else 0
+                }
+                
+                # Get current model info
+                current_model = self.model_registry.get_active_model()
+                current_info = {
+                    'version': current_model.version if current_model else None,
+                    'accuracy': current_model.accuracy if current_model else 0,
+                    'deployment_date': current_model.created_at if current_model else None
+                }
+                
+                return {
+                    'deployment_stats': event_stats,
+                    'health_metrics': health_metrics,
+                    'current_model': current_info,
+                    'backup_count': len(list(self.backup_dir.iterdir())) if self.backup_dir.exists() else 0
+                }
+                
+        except Exception as e:
+            self.logger.error(f"Failed to get deployment metrics: {e}")
+            return {}
+    
+    def schedule_deployment(self, 
+                          target_version: str, 
+                          scheduled_time: datetime,
+                          environments: List[str] = None) -> str:
+        """Schedule a deployment for a specific time"""
+        try:
+            deployment_id = f"scheduled_{target_version}_{int(scheduled_time.timestamp())}"
+            
+            # In a real implementation, this would use a task queue like Celery
+            # For now, just record the scheduled deployment
+            with sqlite3.connect(self.registry_path) as conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS scheduled_deployments (
+                        id TEXT PRIMARY KEY,
+                        target_version TEXT NOT NULL,
+                        scheduled_time TEXT NOT NULL,
+                        environments TEXT,
+                        status TEXT DEFAULT 'pending',
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                conn.execute("""
+                    INSERT INTO scheduled_deployments 
+                    (id, target_version, scheduled_time, environments)
+                    VALUES (?, ?, ?, ?)
+                """, (
+                    deployment_id,
+                    target_version,
+                    scheduled_time.isoformat(),
+                    json.dumps(environments or ["production"])
+                ))
+            
+            self.logger.info(f"Scheduled deployment {deployment_id} for {scheduled_time}")
+            return deployment_id
+            
+        except Exception as e:
+            self.logger.error(f"Failed to schedule deployment: {e}")
+            return ""
+    
+    def get_scheduled_deployments(self) -> List[Dict[str, Any]]:
+        """Get list of scheduled deployments"""
+        try:
+            with sqlite3.connect(self.registry_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute("""
+                    SELECT * FROM scheduled_deployments 
+                    WHERE status = 'pending'
+                    ORDER BY scheduled_time
+                """)
+                
+                deployments = []
+                for row in cursor.fetchall():
+                    deployments.append({
+                        'id': row['id'],
+                        'target_version': row['target_version'],
+                        'scheduled_time': row['scheduled_time'],
+                        'environments': json.loads(row['environments']),
+                        'status': row['status'],
+                        'created_at': row['created_at']
+                    })
+                
+                return deployments
+                
+        except Exception as e:
+            self.logger.error(f"Failed to get scheduled deployments: {e}")
+            return []

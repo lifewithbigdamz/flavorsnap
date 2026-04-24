@@ -42,3 +42,12 @@ export interface CacheStats {
   maxEntries: number;
   defaultTTL: number;
 }
+
+export interface ImageAnnotation {
+  id: string;
+  type: "bbox" | "polygon";
+  coordinates: number[];
+  label: string;
+  confidence?: number;
+  timestamp: string;
+}
