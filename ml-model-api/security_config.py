@@ -916,6 +916,134 @@ class SecurityAuditManager:
         # e.g., Slack, email, PagerDuty, etc.
 
 
+# Import new security components
+from oauth2_handler import oauth2_handler
+from jwt_handler import jwt_token_manager
+from threat_protection import threat_protection
+
 # Initialize global security scanner
 security_scanner = AdvancedSecurityScanner()
 audit_manager = SecurityAuditManager()
+
+# Enhanced security configuration with new components
+class EnhancedSecurityConfig:
+    """Enhanced security configuration integrating OAuth2, JWT, and threat protection"""
+    
+    @staticmethod
+    def initialize_security(app):
+        """Initialize all security components"""
+        # Initialize OAuth2 handler
+        oauth2_handler.init_app(app)
+        
+        # Initialize JWT token manager
+        jwt_token_manager.init_app(app)
+        
+        # Initialize threat protection
+        threat_protection.init_app(app)
+        
+        # Configure security middleware
+        security_middleware = SecurityMiddleware(app)
+        security_monitor = SecurityMonitor(app)
+        
+        # Schedule periodic tasks
+        EnhancedSecurityConfig._schedule_security_tasks(app)
+        
+        app.logger.info("Enhanced security system initialized")
+    
+    @staticmethod
+    def _schedule_security_tasks(app):
+        """Schedule periodic security tasks"""
+        # In a real implementation, you would use a scheduler like Celery
+        # For now, we'll define the tasks that should be scheduled
+        
+        def cleanup_tokens():
+            """Clean up expired tokens"""
+            jwt_token_manager.cleanup_expired_tokens()
+            oauth2_handler.cleanup_expired_tokens()
+        
+        def cleanup_threat_events():
+            """Clean up old threat events"""
+            threat_protection.cleanup_old_events()
+        
+        def rotate_keys():
+            """Rotate JWT keys"""
+            jwt_token_manager.rotate_keys()
+        
+        def run_security_scan():
+            """Run periodic security scan"""
+            audit_manager.run_scheduled_audit()
+        
+        # These would be scheduled to run periodically
+        # cleanup_tokens() - every hour
+        # cleanup_threat_events() - every day
+        # rotate_keys() - every week
+        # run_security_scan() - every day
+    
+    @staticmethod
+    def get_security_status() -> Dict[str, Any]:
+        """Get comprehensive security status"""
+        return {
+            'oauth2': {
+                'active_clients': len(oauth2_handler.clients),
+                'active_tokens': len(oauth2_handler.tokens),
+                'active_codes': len(oauth2_handler.authorization_codes)
+            },
+            'jwt': jwt_token_manager.get_statistics(),
+            'threat_protection': {
+                'blocked_ips': len(threat_protection.blocked_ips),
+                'threat_events': len(threat_protection.threat_events),
+                'metrics': threat_protection.get_threat_metrics()
+            },
+            'security_scanner': {
+                'last_scan': security_scanner.scan_results.get('timestamp'),
+                'security_score': security_scanner.scan_results.get('security_score'),
+                'vulnerabilities': len(security_scanner.scan_results.get('vulnerabilities', [])),
+                'compliance_issues': len(security_scanner.scan_results.get('compliance_issues', []))
+            }
+        }
+    
+    @staticmethod
+    def validate_request_security(request) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
+        """Comprehensive request security validation"""
+        errors = []
+        warnings = []
+        
+        # Validate OAuth2/JWT token if present
+        auth_header = request.headers.get('Authorization')
+        if auth_header:
+            if auth_header.startswith('Bearer '):
+                token = auth_header[7:]
+                
+                # Try JWT validation first
+                is_valid, payload, error = jwt_token_manager.validate_token(token)
+                if is_valid:
+                    # Token is valid JWT
+                    pass
+                else:
+                    # Try OAuth2 validation
+                    token_obj = oauth2_handler.validate_access_token(token)
+                    if token_obj:
+                        # Token is valid OAuth2
+                        pass
+                    else:
+                        errors.append(f"Invalid authentication token: {error}")
+        
+        # Check threat protection
+        ip_address = request.remote_addr
+        if ip_address in threat_protection.blocked_ips:
+            errors.append("IP address is blocked")
+        
+        # Validate request size
+        content_length = request.content_length or 0
+        if content_length > SecurityConfig.MAX_CONTENT_LENGTH:
+            errors.append(f"Request too large: {content_length} bytes")
+        
+        # Validate content type
+        if request.content_type and request.content_type not in SecurityConfig.ALLOWED_MIME_TYPES:
+            if not request.content_type.startswith('application/json'):
+                warnings.append(f"Unusual content type: {request.content_type}")
+        
+        return len(errors) == 0, '; '.join(errors) if errors else None, {
+            'warnings': warnings,
+            'threat_score': getattr(request, 'threat_score', 0)
+        }
