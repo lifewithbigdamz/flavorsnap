@@ -118,6 +118,25 @@ export default function Classify() {
           </div>
         </div>
 
+        <div className="mt-8 rounded-2xl bg-white p-8 shadow-lg">
+          <div className="flex flex-col gap-6 md:flex-row md:items-center md:justify-between">
+            <div>
+              <h2 className="text-2xl font-bold text-gray-900">Image Annotation</h2>
+              <p className="mt-2 max-w-2xl text-gray-600">
+                Mark regions of interest with bounding boxes and polygons, edit labels, save feedback, and export annotations for model training.
+              </p>
+            </div>
+            <button
+              onClick={() => router.push('/annotate')}
+              onKeyDown={(e) => handleKeyDown(e, () => router.push('/annotate'))}
+              className="w-full md:w-auto bg-amber-500 text-white py-3 px-6 rounded-lg font-semibold hover:bg-amber-600 transition focus:outline-none focus:ring-4 focus:ring-amber-500/50"
+              aria-label="Open image annotation workspace"
+            >
+              Open Annotation Workspace
+            </button>
+          </div>
+        </div>
+
         <div className="mt-12 text-center">
           <button
             onClick={() => router.push('/')}

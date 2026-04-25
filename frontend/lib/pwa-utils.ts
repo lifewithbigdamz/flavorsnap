@@ -22,6 +22,30 @@ export interface PushSubscriptionOptions {
   applicationServerKey?: ArrayBuffer | string;
 }
 
+export interface PerformanceMetrics {
+  cacheHits: number;
+  cacheMisses: number;
+  networkRequests: number;
+  offlineRequests: number;
+  averageResponseTime: number;
+  totalResponseTime: number;
+  requestCount: number;
+}
+
+export interface OfflineAnalytics {
+  type: string;
+  timestamp: number;
+  data?: any;
+}
+
+export interface CacheStrategy {
+  name: string;
+  pattern: RegExp;
+  strategy: 'cache-first' | 'network-first' | 'stale-while-revalidate';
+  maxAge: number;
+  maxEntries: number;
+}
+
 export class PWAManager {
   private static instance: PWAManager;
   private deferredPrompt: BeforeInstallPromptEvent | null = null;

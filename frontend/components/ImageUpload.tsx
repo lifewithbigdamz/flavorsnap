@@ -8,14 +8,27 @@ interface ImageUploadProps {
   loading?: boolean;
   disabled?: boolean;
   uploadProgress?: number; // Progress percentage (0-100)
+  uploadStatus?: string; // Current status of the upload/async operation
 }
 
-export function ImageUpload({ onImageSelect, onError, loading = false, disabled = false, uploadProgress }: ImageUploadProps) {
+export function ImageUpload({ onImageSelect, onError, loading = false, disabled = false, uploadProgress, uploadStatus }: ImageUploadProps) {
   const { t } = useTranslation('common');
   const [isDragging, setIsDragging] = useState(false);
   const [isTouching, setIsTouching] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragCounter = useRef(0);
+
+  const getStatusMessage = (status?: string) => {
+    if (!status) return t('processing');
+    switch (status) {
+      case 'starting': return t('status_starting', 'Starting...');
+      case 'uploading': return t('status_uploading', 'Uploading image...');
+      case 'processing': return t('status_processing', 'Analyzing food...');
+      case 'complete': return t('status_complete', 'Analysis complete!');
+      case 'cached': return t('status_cached', 'Retrieved from cache');
+      default: return t('status_processing', 'Processing...');
+    }
+  };
 
   const handleDragEnter = useCallback((e: DragEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -185,20 +198,24 @@ export function ImageUpload({ onImageSelect, onError, loading = false, disabled 
           
           <div className="text-center">
             <p className="text-sm sm:text-base font-medium text-gray-700 dark:text-gray-300 mb-1">
-              {loading ? t('processing') : isDragging ? t('drop_image_here') : t('drag_drop_image')}
+              {loading ? getStatusMessage(uploadStatus) : isDragging ? t('drop_image_here') : t('drag_drop_image')}
             </p>
-            <p className="text-xs sm:text-sm text-gray-500 dark:text-gray-500">
-              {t('or_click_to_select')}
-            </p>
+            {!loading && (
+              <p className="text-xs sm:text-sm text-gray-500 dark:text-gray-500">
+                {t('or_click_to_select')}
+              </p>
+            )}
           </div>
         </div>
         
         {/* Mobile-specific hint */}
-        <div className="absolute bottom-2 left-2 right-2 sm:hidden">
-          <p className="text-xs text-gray-400 text-center" aria-hidden="true">
-            {t('tap_to_upload')}
-          </p>
-        </div>
+        {!loading && (
+          <div className="absolute bottom-2 left-2 right-2 sm:hidden">
+            <p className="text-xs text-gray-400 text-center" aria-hidden="true">
+              {t('tap_to_upload')}
+            </p>
+          </div>
+        )}
         
         {/* Drag overlay for screen readers */}
         {isDragging && (
@@ -215,11 +232,21 @@ export function ImageUpload({ onImageSelect, onError, loading = false, disabled 
       </div>
       
       {/* Upload progress bar */}
-      {uploadProgress !== undefined && uploadProgress > 0 && uploadProgress < 100 && (
+      {((uploadProgress !== undefined && uploadProgress > 0) || loading) && (
         <div className="mt-3">
+          <div className="flex justify-between items-center mb-1">
+            <span className="text-xs font-medium text-gray-500 dark:text-gray-400">
+              {getStatusMessage(uploadStatus)}
+            </span>
+            {uploadProgress !== undefined && (
+              <span className="text-xs font-medium text-accent">
+                {Math.round(uploadProgress)}%
+              </span>
+            )}
+          </div>
           <div 
             id="upload-progress"
-            className="h-2 bg-gray-200 rounded-full overflow-hidden"
+            className="h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden"
             role="progressbar"
             aria-valuenow={uploadProgress}
             aria-valuemin={0}
@@ -227,12 +254,15 @@ export function ImageUpload({ onImageSelect, onError, loading = false, disabled 
             aria-label={t('upload_progress', 'Upload progress: {{progress}}%', { progress: uploadProgress })}
           >
             <div 
-              className="h-full bg-accent transition-all duration-300 ease-out"
-              style={{ width: `${uploadProgress}%` }}
+              className={`h-full bg-accent transition-all duration-300 ease-out ${uploadProgress === 100 && uploadStatus === 'processing' ? 'animate-pulse' : ''}`}
+              style={{ width: `${uploadProgress ?? 0}%` }}
             />
           </div>
           <div className="sr-only" aria-live="polite" aria-atomic="true">
-            {t('upload_progress_announcement', 'Upload progress: {{progress}}%', { progress: uploadProgress })}
+            {t('upload_progress_announcement', 'Upload progress: {{progress}}% - {{status}}', { 
+              progress: uploadProgress, 
+              status: getStatusMessage(uploadStatus) 
+            })}
           </div>
         </div>
       )}

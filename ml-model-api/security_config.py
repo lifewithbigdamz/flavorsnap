@@ -1,11 +1,18 @@
 """
-Security configuration and middleware for FlavorSnap API
+Enhanced Security configuration and middleware for FlavorSnap API
+Implements comprehensive security scanning, vulnerability detection, and remediation
 """
 import os
 import re
 import hashlib
 import hmac
+import json
+import logging
+import subprocess
+import tempfile
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any
 from PIL import Image
 import io
 
@@ -591,3 +598,452 @@ def validate_json_input(data: Dict[str, Any], required_fields: list = None, sche
             return False, f"Missing required fields: {', '.join(missing)}"
 
     return True, None
+
+
+class AdvancedSecurityScanner:
+    """Advanced security scanning and vulnerability detection"""
+    
+    def __init__(self, app=None):
+        self.app = app
+        self.logger = logging.getLogger(__name__)
+        self.scan_results = {
+            'timestamp': datetime.now().isoformat(),
+            'vulnerabilities': [],
+            'compliance_issues': [],
+            'security_score': 100
+        }
+    
+    def run_comprehensive_scan(self) -> Dict[str, Any]:
+        """Run comprehensive security scan"""
+        self.logger.info("Starting comprehensive security scan...")
+        
+        # Dependency vulnerability scan
+        dependency_vulns = self._scan_dependencies()
+        self.scan_results['vulnerabilities'].extend(dependency_vulns)
+        
+        # Code security analysis
+        code_issues = self._scan_code_security()
+        self.scan_results['vulnerabilities'].extend(code_issues)
+        
+        # Configuration compliance check
+        compliance_issues = self._check_compliance()
+        self.scan_results['compliance_issues'].extend(compliance_issues)
+        
+        # Calculate security score
+        self._calculate_security_score()
+        
+        self.logger.info(f"Security scan completed. Score: {self.scan_results['security_score']}")
+        return self.scan_results
+    
+    def _scan_dependencies(self) -> List[Dict[str, Any]]:
+        """Scan for dependency vulnerabilities"""
+        vulnerabilities = []
+        
+        try:
+            # Check Python dependencies with Safety
+            result = subprocess.run(
+                ['python', '-m', 'safety', 'check', '--json'],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            
+            if result.stdout:
+                try:
+                    safety_data = json.loads(result.stdout)
+                    for vuln in safety_data:
+                        vulnerabilities.append({
+                            'type': 'dependency',
+                            'tool': 'safety',
+                            'package': vuln.get('package', 'unknown'),
+                            'version': vuln.get('version', 'unknown'),
+                            'vulnerability_id': vuln.get('vulnerability_id', ''),
+                            'advisory': vuln.get('advisory', ''),
+                            'severity': self._assess_dependency_severity(vuln),
+                            'remediation': f"Upgrade {vuln.get('package', 'unknown')} to safe version"
+                        })
+                except json.JSONDecodeError:
+                    self.logger.warning("Could not parse Safety output")
+                    
+        except subprocess.TimeoutExpired:
+            self.logger.warning("Dependency scan timed out")
+        except subprocess.CalledProcessError as e:
+            self.logger.warning(f"Dependency scan failed: {e}")
+        except FileNotFoundError:
+            self.logger.info("Safety not installed, skipping dependency scan")
+        
+        return vulnerabilities
+    
+    def _scan_code_security(self) -> List[Dict[str, Any]]:
+        """Scan code for security issues"""
+        issues = []
+        
+        try:
+            # Run Bandit static analysis
+            result = subprocess.run(
+                ['python', '-m', 'bandit', '-r', '.', '-f', 'json'],
+                capture_output=True,
+                text=True,
+                timeout=120
+            )
+            
+            if result.stdout:
+                try:
+                    bandit_data = json.loads(result.stdout)
+                    for issue in bandit_data.get('results', []):
+                        issues.append({
+                            'type': 'code_security',
+                            'tool': 'bandit',
+                            'file': issue.get('filename', ''),
+                            'line': issue.get('line_number', 0),
+                            'test_id': issue.get('test_id', ''),
+                            'test_name': issue.get('test_name', ''),
+                            'issue_text': issue.get('issue_text', ''),
+                            'severity': issue.get('issue_severity', 'LOW'),
+                            'confidence': issue.get('issue_confidence', 'LOW'),
+                            'remediation': f"Fix {issue.get('test_name', '')} in {issue.get('filename', '')}:{issue.get('line_number', 0)}"
+                        })
+                except json.JSONDecodeError:
+                    self.logger.warning("Could not parse Bandit output")
+                    
+        except subprocess.TimeoutExpired:
+            self.logger.warning("Code security scan timed out")
+        except subprocess.CalledProcessError as e:
+            self.logger.warning(f"Code security scan failed: {e}")
+        except FileNotFoundError:
+            self.logger.info("Bandit not installed, skipping code security scan")
+        
+        return issues
+    
+    def _check_compliance(self) -> List[Dict[str, Any]]:
+        """Check security compliance"""
+        compliance_issues = []
+        
+        # Check for hardcoded secrets
+        secret_patterns = [
+            (r'password\s*=\s*[\"\\\'][^\"\\\']+[\"\\\']', 'Hardcoded password'),
+            (r'api_key\s*=\s*[\"\\\'][^\"\\\']+[\"\\\']', 'Hardcoded API key'),
+            (r'secret\s*=\s*[\"\\\'][^\"\\\']+[\"\\\']', 'Hardcoded secret'),
+            (r'token\s*=\s*[\"\\\'][^\"\\\']+[\"\\\']', 'Hardcoded token')
+        ]
+        
+        # Scan Python files for secrets
+        for py_file in Path('.').rglob('*.py'):
+            if any(skip in str(py_file) for skip in ['__pycache__', 'venv', '.git']):
+                continue
+                
+            try:
+                content = py_file.read_text()
+                for pattern, description in secret_patterns:
+                    matches = re.findall(pattern, content, re.IGNORECASE)
+                    if matches:
+                        compliance_issues.append({
+                            'type': 'compliance',
+                            'category': 'hardcoded_secrets',
+                            'file': str(py_file),
+                            'issue': description,
+                            'severity': 'HIGH',
+                            'remediation': f"Replace hardcoded secret in {py_file.name} with environment variable"
+                        })
+            except Exception as e:
+                self.logger.warning(f"Could not scan {py_file}: {e}")
+        
+        # Check security headers configuration
+        if not self._verify_security_headers():
+            compliance_issues.append({
+                'type': 'compliance',
+                'category': 'security_headers',
+                'issue': 'Missing or incomplete security headers',
+                'severity': 'MEDIUM',
+                'remediation': 'Configure all required security headers in SecurityConfig.SECURITY_HEADERS'
+            })
+        
+        return compliance_issues
+    
+    def _verify_security_headers(self) -> bool:
+        """Verify security headers are properly configured"""
+        required_headers = set(SecurityConfig.SECURITY_HEADERS.keys())
+        return len(required_headers) >= 7  # Expect at least 7 security headers
+    
+    def _assess_dependency_severity(self, vulnerability: Dict[str, Any]) -> str:
+        """Assess severity of dependency vulnerability"""
+        vuln_id = vulnerability.get('vulnerability_id', '').upper()
+        
+        if 'CVE-' in vuln_id:
+            # CVSS-based assessment (simplified)
+            return 'HIGH'
+        elif vulnerability.get('advisory', '').lower() in ['critical', 'high']:
+            return 'HIGH'
+        else:
+            return 'MEDIUM'
+    
+    def _calculate_security_score(self) -> None:
+        """Calculate overall security score"""
+        score = 100
+        
+        # Deduct points for vulnerabilities
+        for vuln in self.scan_results['vulnerabilities']:
+            severity = vuln.get('severity', 'LOW').upper()
+            if severity == 'CRITICAL':
+                score -= 25
+            elif severity == 'HIGH':
+                score -= 15
+            elif severity == 'MEDIUM':
+                score -= 8
+            elif severity == 'LOW':
+                score -= 3
+        
+        # Deduct points for compliance issues
+        for issue in self.scan_results['compliance_issues']:
+            severity = issue.get('severity', 'LOW').upper()
+            if severity == 'CRITICAL':
+                score -= 20
+            elif severity == 'HIGH':
+                score -= 10
+            elif severity == 'MEDIUM':
+                score -= 5
+            elif severity == 'LOW':
+                score -= 2
+        
+        self.scan_results['security_score'] = max(0, score)
+    
+    def generate_remediation_plan(self) -> Dict[str, Any]:
+        """Generate automated remediation plan"""
+        plan = {
+            'timestamp': datetime.now().isoformat(),
+            'automatable_fixes': [],
+            'manual_review_required': [],
+            'priority_actions': []
+        }
+        
+        # Categorize vulnerabilities
+        for vuln in self.scan_results['vulnerabilities']:
+            if vuln.get('type') == 'dependency' and vuln.get('severity') in ['LOW', 'MEDIUM']:
+                plan['automatable_fixes'].append(vuln)
+            else:
+                plan['manual_review_required'].append(vuln)
+        
+        for issue in self.scan_results['compliance_issues']:
+            if issue.get('category') == 'hardcoded_secrets':
+                plan['priority_actions'].append(issue)
+            else:
+                plan['manual_review_required'].append(issue)
+        
+        return plan
+    
+    def export_report(self, output_path: Optional[str] = None) -> str:
+        """Export security scan report"""
+        if output_path:
+            report_path = Path(output_path)
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            report_path = Path(f"security_report_{timestamp}.json")
+        
+        report_data = {
+            'scan_metadata': {
+                'timestamp': self.scan_results['timestamp'],
+                'scanner_version': '2.0.0',
+                'security_score': self.scan_results['security_score']
+            },
+            'vulnerabilities': self.scan_results['vulnerabilities'],
+            'compliance_issues': self.scan_results['compliance_issues'],
+            'remediation_plan': self.generate_remediation_plan(),
+            'summary': {
+                'total_vulnerabilities': len(self.scan_results['vulnerabilities']),
+                'total_compliance_issues': len(self.scan_results['compliance_issues']),
+                'security_score': self.scan_results['security_score']
+            }
+        }
+        
+        with open(report_path, 'w') as f:
+            json.dump(report_data, f, indent=2)
+        
+        self.logger.info(f"Security report exported to {report_path}")
+        return str(report_path)
+
+
+class SecurityAuditManager:
+    """Manages security audits and compliance checks"""
+    
+    def __init__(self):
+        self.scanner = AdvancedSecurityScanner()
+        self.audit_log = []
+    
+    def run_scheduled_audit(self) -> Dict[str, Any]:
+        """Run scheduled security audit"""
+        self.logger = logging.getLogger(__name__)
+        self.logger.info("Starting scheduled security audit...")
+        
+        # Run comprehensive scan
+        scan_results = self.scanner.run_comprehensive_scan()
+        
+        # Log audit
+        audit_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'type': 'scheduled_audit',
+            'security_score': scan_results['security_score'],
+            'vulnerabilities_found': len(scan_results['vulnerabilities']),
+            'compliance_issues': len(scan_results['compliance_issues'])
+        }
+        self.audit_log.append(audit_entry)
+        
+        # Generate alerts for critical issues
+        critical_issues = [v for v in scan_results['vulnerabilities'] if v.get('severity') == 'CRITICAL']
+        if critical_issues:
+            self._send_security_alert(critical_issues)
+        
+        return scan_results
+    
+    def _send_security_alert(self, critical_issues: List[Dict[str, Any]]) -> None:
+        """Send security alert for critical issues"""
+        alert_message = f"🚨 CRITICAL SECURITY ALERT\n\n"
+        alert_message += f"Found {len(critical_issues)} critical security vulnerabilities:\n\n"
+        
+        for i, issue in enumerate(critical_issues[:5], 1):
+            alert_message += f"{i}. {issue.get('issue_text', 'Unknown issue')}\n"
+            alert_message += f"   File: {issue.get('file', 'Unknown')}\n"
+            alert_message += f"   Tool: {issue.get('tool', 'Unknown')}\n\n"
+        
+        if len(critical_issues) > 5:
+            alert_message += f"... and {len(critical_issues) - 5} more critical issues\n\n"
+        
+        alert_message += "IMMEDIATE ACTION REQUIRED!\n"
+        alert_message += "Please review and address these critical security vulnerabilities."
+        
+        self.logger.critical(alert_message)
+        
+        # Here you could integrate with notification systems
+        # e.g., Slack, email, PagerDuty, etc.
+
+
+# Import new security components
+from oauth2_handler import oauth2_handler
+from jwt_handler import jwt_token_manager
+from threat_protection import threat_protection
+
+# Initialize global security scanner
+security_scanner = AdvancedSecurityScanner()
+audit_manager = SecurityAuditManager()
+
+# Enhanced security configuration with new components
+class EnhancedSecurityConfig:
+    """Enhanced security configuration integrating OAuth2, JWT, and threat protection"""
+    
+    @staticmethod
+    def initialize_security(app):
+        """Initialize all security components"""
+        # Initialize OAuth2 handler
+        oauth2_handler.init_app(app)
+        
+        # Initialize JWT token manager
+        jwt_token_manager.init_app(app)
+        
+        # Initialize threat protection
+        threat_protection.init_app(app)
+        
+        # Configure security middleware
+        security_middleware = SecurityMiddleware(app)
+        security_monitor = SecurityMonitor(app)
+        
+        # Schedule periodic tasks
+        EnhancedSecurityConfig._schedule_security_tasks(app)
+        
+        app.logger.info("Enhanced security system initialized")
+    
+    @staticmethod
+    def _schedule_security_tasks(app):
+        """Schedule periodic security tasks"""
+        # In a real implementation, you would use a scheduler like Celery
+        # For now, we'll define the tasks that should be scheduled
+        
+        def cleanup_tokens():
+            """Clean up expired tokens"""
+            jwt_token_manager.cleanup_expired_tokens()
+            oauth2_handler.cleanup_expired_tokens()
+        
+        def cleanup_threat_events():
+            """Clean up old threat events"""
+            threat_protection.cleanup_old_events()
+        
+        def rotate_keys():
+            """Rotate JWT keys"""
+            jwt_token_manager.rotate_keys()
+        
+        def run_security_scan():
+            """Run periodic security scan"""
+            audit_manager.run_scheduled_audit()
+        
+        # These would be scheduled to run periodically
+        # cleanup_tokens() - every hour
+        # cleanup_threat_events() - every day
+        # rotate_keys() - every week
+        # run_security_scan() - every day
+    
+    @staticmethod
+    def get_security_status() -> Dict[str, Any]:
+        """Get comprehensive security status"""
+        return {
+            'oauth2': {
+                'active_clients': len(oauth2_handler.clients),
+                'active_tokens': len(oauth2_handler.tokens),
+                'active_codes': len(oauth2_handler.authorization_codes)
+            },
+            'jwt': jwt_token_manager.get_statistics(),
+            'threat_protection': {
+                'blocked_ips': len(threat_protection.blocked_ips),
+                'threat_events': len(threat_protection.threat_events),
+                'metrics': threat_protection.get_threat_metrics()
+            },
+            'security_scanner': {
+                'last_scan': security_scanner.scan_results.get('timestamp'),
+                'security_score': security_scanner.scan_results.get('security_score'),
+                'vulnerabilities': len(security_scanner.scan_results.get('vulnerabilities', [])),
+                'compliance_issues': len(security_scanner.scan_results.get('compliance_issues', []))
+            }
+        }
+    
+    @staticmethod
+    def validate_request_security(request) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
+        """Comprehensive request security validation"""
+        errors = []
+        warnings = []
+        
+        # Validate OAuth2/JWT token if present
+        auth_header = request.headers.get('Authorization')
+        if auth_header:
+            if auth_header.startswith('Bearer '):
+                token = auth_header[7:]
+                
+                # Try JWT validation first
+                is_valid, payload, error = jwt_token_manager.validate_token(token)
+                if is_valid:
+                    # Token is valid JWT
+                    pass
+                else:
+                    # Try OAuth2 validation
+                    token_obj = oauth2_handler.validate_access_token(token)
+                    if token_obj:
+                        # Token is valid OAuth2
+                        pass
+                    else:
+                        errors.append(f"Invalid authentication token: {error}")
+        
+        # Check threat protection
+        ip_address = request.remote_addr
+        if ip_address in threat_protection.blocked_ips:
+            errors.append("IP address is blocked")
+        
+        # Validate request size
+        content_length = request.content_length or 0
+        if content_length > SecurityConfig.MAX_CONTENT_LENGTH:
+            errors.append(f"Request too large: {content_length} bytes")
+        
+        # Validate content type
+        if request.content_type and request.content_type not in SecurityConfig.ALLOWED_MIME_TYPES:
+            if not request.content_type.startswith('application/json'):
+                warnings.append(f"Unusual content type: {request.content_type}")
+        
+        return len(errors) == 0, '; '.join(errors) if errors else None, {
+            'warnings': warnings,
+            'threat_score': getattr(request, 'threat_score', 0)
+        }

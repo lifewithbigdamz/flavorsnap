@@ -25,6 +25,7 @@ export default function Classify() {
   const [classification, setClassification] = useState<ClassificationResult | null>(null);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [uploadProgress, setUploadProgress] = useState<number>(0);
+  const [uploadStatus, setUploadStatus] = useState<string>('');
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // Load history from local storage on mount
@@ -46,6 +47,7 @@ export default function Classify() {
     setClassification(null);
     setError(null);
     setUploadProgress(0);
+    setUploadStatus('');
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
@@ -69,6 +71,7 @@ export default function Classify() {
       setError(null);
       setClassification(null);
       setUploadProgress(0);
+      setUploadStatus('');
     }
   };
 
@@ -97,10 +100,12 @@ export default function Classify() {
       const response = await api.post<ClassificationResult>('/api/classify', formData, {
         retries: 2,
         retryDelay: 1000
-      }, (progress) => {
+      }, (progress, status) => {
         setUploadProgress(progress);
+        if (status) setUploadStatus(status);
         if (announcement && progress % 25 === 0) {
-          announcement.textContent = t('upload_progress_voice', 'Upload progress: {{progress}}%', { progress });
+          const statusMsg = status === 'uploading' ? t('uploading') : status === 'processing' ? t('processing') : '';
+          announcement.textContent = `${statusMsg} ${t('upload_progress_voice', 'Upload progress: {{progress}}%', { progress })}`;
         }
       });
 
@@ -226,6 +231,7 @@ export default function Classify() {
             loading={loading}
             disabled={loading}
             uploadProgress={uploadProgress}
+            uploadStatus={uploadStatus}
           />
         )}
 
@@ -270,9 +276,18 @@ export default function Classify() {
                   aria-label={loading ? t('classifying') : t('classify_food')}
                 >
                   {loading ? (
-                    <div className="flex items-center gap-3">
-                      <div className="animate-spin h-6 w-6 sm:h-7 sm:w-7 border-4 border-white border-t-transparent rounded-full" />
-                      <span>{t('classifying')}</span>
+                    <div className="flex flex-col items-center gap-2">
+                      <div className="flex items-center gap-3">
+                        <div className="animate-spin h-6 w-6 sm:h-7 sm:w-7 border-4 border-white border-t-transparent rounded-full" />
+                        <span>
+                          {uploadStatus === 'uploading' ? t('uploading', 'Uploading...') : 
+                           uploadStatus === 'processing' ? t('processing', 'Analyzing...') : 
+                           t('classifying')}
+                        </span>
+                      </div>
+                      {uploadProgress > 0 && (
+                        <span className="text-xs font-medium opacity-80">{Math.round(uploadProgress)}%</span>
+                      )}
                     </div>
                   ) : (
                     <>
@@ -282,10 +297,10 @@ export default function Classify() {
                   )}
                   
                   {/* Progress bar overlay */}
-                  {uploadProgress > 0 && uploadProgress < 100 && (
-                    <div className="absolute bottom-0 left-0 right-0 h-1 bg-emerald-800/30">
+                  {loading && uploadProgress > 0 && (
+                    <div className="absolute bottom-0 left-0 right-0 h-2 bg-emerald-800/30">
                       <div 
-                        className="h-full bg-white/80 transition-all duration-300"
+                        className={`h-full bg-white/80 transition-all duration-300 ${uploadProgress === 100 && uploadStatus === 'processing' ? 'animate-pulse' : ''}`}
                         style={{ width: `${uploadProgress}%` }}
                       />
                     </div>

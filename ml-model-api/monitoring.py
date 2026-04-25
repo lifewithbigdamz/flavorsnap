@@ -569,473 +569,495 @@ def update_model_accuracy(accuracy: float):
     """Update model accuracy metric"""
     MODEL_ACCURACY.set(accuracy)
 
-# Advanced Backup and Recovery Monitoring Metrics
-BACKUP_OPERATIONS = Counter(
-    'backup_operations_total',
-    'Total backup operations',
-    ['backup_type', 'status']
-)
-
-BACKUP_DURATION = Histogram(
-    'backup_duration_seconds',
-    'Backup operation duration in seconds',
-    ['backup_type'],
-    buckets=[60, 300, 900, 1800, 3600, 7200]
-)
-
-BACKUP_SIZE = Gauge(
-    'backup_size_bytes',
-    'Current backup size in bytes'
-)
-
-BACKUP_RETENTION_DAYS = Gauge(
-    'backup_retention_days',
-    'Backup retention period in days'
-)
-
-RECOVERY_OPERATIONS = Counter(
-    'recovery_operations_total',
-    'Total recovery operations',
-    ['recovery_type', 'status']
-)
-
-RECOVERY_DURATION = Histogram(
-    'recovery_duration_seconds',
-    'Recovery operation duration in seconds',
-    ['recovery_type'],
-    buckets=[300, 900, 1800, 3600, 7200, 14400]
-)
-
-DISASTER_EVENTS = Counter(
-    'disaster_events_total',
-    'Total disaster events',
-    ['disaster_level', 'status']
-)
-
-DISASTER_RECOVERY_TIME = Histogram(
-    'disaster_recovery_time_seconds',
-    'Disaster recovery time in seconds',
-    ['disaster_level'],
-    buckets=[300, 900, 1800, 3600, 7200, 86400]
-)
-
-BACKUP_VERIFICATION_RESULTS = Counter(
-    'backup_verification_results_total',
-    'Backup verification results',
-    ['result']
-)
-
-RECOVERY_TEST_RESULTS = Counter(
-    'recovery_test_results_total',
-    'Recovery test results',
-    ['result']
-)
+@dataclass
+class Alert:
+    """Alert data structure"""
+    timestamp: datetime
+    severity: str  # critical, warning, info
+    type: str
+    message: str
+    source: str
+    resolved: bool = False
+    resolved_at: Optional[datetime] = None
 
 @dataclass
-class BackupMonitoringConfig:
-    """Configuration for backup monitoring"""
-    enable_backup_metrics: bool = True
-    enable_recovery_metrics: bool = True
-    enable_disaster_metrics: bool = True
-    backup_alert_threshold_gb: float = 50.0
-    recovery_alert_threshold_minutes: float = 30.0
-    disaster_alert_threshold_minutes: float = 15.0
+class HealthCheck:
+    """Health check data structure"""
+    service_name: str
+    status: str  # healthy, unhealthy, degraded
+    timestamp: datetime
+    response_time: float
+    error_message: Optional[str] = None
+    metrics: Dict[str, Any] = None
 
-class BackupMonitoringSystem:
-    """Advanced backup and recovery monitoring system"""
+class InfrastructureMonitor:
+    """Comprehensive infrastructure monitoring system"""
     
-    def __init__(self, config: BackupMonitoringConfig):
-        self.config = config
-        self.logger = logging.getLogger(__name__)
-        self.monitoring_active = False
-        self.monitoring_thread = None
-        self.backup_metrics_cache = {}
-        self.recovery_metrics_cache = {}
+    def __init__(self, app: Flask = None):
+        self.app = app
+        self.logger = logging.getLogger('InfrastructureMonitor')
+        self.alerts: List[Alert] = []
+        self.health_checks: Dict[str, HealthCheck] = {}
+        self.metrics_history: List[Dict[str, Any]] = []
+        self.alert_thresholds = {
+            'cpu_usage': 80.0,
+            'memory_usage': 85.0,
+            'disk_usage': 90.0,
+            'response_time': 5.0,
+            'error_rate': 5.0
+        }
         
-        # Initialize monitoring database
-        self.db_path = '/tmp/backup_monitoring.db'
-        self._init_monitoring_db()
-        
-        self.logger.info("BackupMonitoringSystem initialized")
+        if app:
+            self.init_app(app)
     
-    def _init_monitoring_db(self):
-        """Initialize monitoring database"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+    def init_app(self, app: Flask):
+        """Initialize monitoring with Flask app"""
+        self.app = app
         
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS backup_metrics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                backup_id TEXT NOT NULL,
-                backup_type TEXT NOT NULL,
-                duration_seconds REAL,
-                size_bytes INTEGER,
-                status TEXT NOT NULL,
-                verification_result TEXT
-            )
-        ''')
+        # Add additional monitoring endpoints
+        @app.route('/monitoring/health')
+        def monitoring_health():
+            return self.get_overall_health()
         
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS recovery_metrics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                recovery_id TEXT NOT NULL,
-                recovery_type TEXT NOT NULL,
-                duration_seconds REAL,
-                status TEXT NOT NULL,
-                backup_id TEXT
-            )
-        ''')
+        @app.route('/monitoring/alerts')
+        def get_alerts():
+            return self.get_active_alerts()
         
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS disaster_metrics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                event_id TEXT NOT NULL,
-                disaster_level TEXT NOT NULL,
-                recovery_time_seconds REAL,
-                status TEXT NOT NULL
-            )
-        ''')
+        @app.route('/monitoring/metrics/history')
+        def metrics_history():
+            return self.get_metrics_history()
         
-        conn.commit()
-        conn.close()
+        @app.route('/monitoring/status')
+        def infrastructure_status():
+            return self.get_infrastructure_status()
     
-    def record_backup_operation(self, backup_id: str, backup_type: str, 
-                              duration_seconds: float, size_bytes: int, 
-                              status: str, verification_result: Optional[str] = None):
-        """Record backup operation metrics"""
-        if not self.config.enable_backup_metrics:
-            return
-        
+    def collect_system_metrics(self) -> Dict[str, Any]:
+        """Collect comprehensive system metrics"""
         try:
-            # Update Prometheus metrics
-            BACKUP_OPERATIONS.labels(backup_type=backup_type, status=status).inc()
-            BACKUP_DURATION.labels(backup_type=backup_type).observe(duration_seconds)
-            BACKUP_SIZE.set(size_bytes)
+            # CPU metrics
+            cpu_percent = psutil.cpu_percent(interval=1)
+            cpu_count = psutil.cpu_count()
+            load_avg = psutil.getloadavg() if hasattr(psutil, 'getloadavg') else [0, 0, 0]
             
-            # Record to database
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            # Memory metrics
+            memory = psutil.virtual_memory()
+            swap = psutil.swap_memory()
             
-            cursor.execute('''
-                INSERT INTO backup_metrics 
-                (timestamp, backup_id, backup_type, duration_seconds, size_bytes, status, verification_result)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                datetime.now(pytz.UTC).isoformat(),
-                backup_id,
-                backup_type,
-                duration_seconds,
-                size_bytes,
-                status,
-                verification_result
-            ))
+            # Disk metrics
+            disk_partitions = psutil.disk_partitions()
+            disk_usage = {}
+            for partition in disk_partitions:
+                try:
+                    usage = psutil.disk_usage(partition.mountpoint)
+                    disk_usage[partition.mountpoint] = {
+                        'total': usage.total,
+                        'used': usage.used,
+                        'free': usage.free,
+                        'percent': usage.percent
+                    }
+                except PermissionError:
+                    continue
             
-            conn.commit()
-            conn.close()
+            # Network metrics
+            network_io = psutil.net_io_counters()
+            network_interfaces = psutil.net_if_addrs()
             
-            # Cache metrics
-            self.backup_metrics_cache[backup_id] = {
-                'timestamp': datetime.now(pytz.UTC),
-                'backup_type': backup_type,
-                'duration_seconds': duration_seconds,
-                'size_bytes': size_bytes,
-                'status': status,
-                'verification_result': verification_result
+            # Process metrics
+            process_count = len(psutil.pids())
+            
+            # GPU metrics
+            gpu_metrics = {}
+            if torch.cuda.is_available():
+                for i in range(torch.cuda.device_count()):
+                    gpu_metrics[f'gpu_{i}'] = {
+                        'memory_allocated': torch.cuda.memory_allocated(i),
+                        'memory_cached': torch.cuda.memory_reserved(i),
+                        'memory_total': torch.cuda.get_device_properties(i).total_memory
+                    }
+            
+            metrics = {
+                'timestamp': datetime.now().isoformat(),
+                'cpu': {
+                    'percent': cpu_percent,
+                    'count': cpu_count,
+                    'load_average': {
+                        '1min': load_avg[0],
+                        '5min': load_avg[1],
+                        '15min': load_avg[2]
+                    }
+                },
+                'memory': {
+                    'total': memory.total,
+                    'available': memory.available,
+                    'percent': memory.percent,
+                    'used': memory.used,
+                    'cached': getattr(memory, 'cached', 0)
+                },
+                'swap': {
+                    'total': swap.total,
+                    'used': swap.used,
+                    'free': swap.free,
+                    'percent': swap.percent
+                },
+                'disk': disk_usage,
+                'network': {
+                    'bytes_sent': network_io.bytes_sent,
+                    'bytes_recv': network_io.bytes_recv,
+                    'packets_sent': network_io.packets_sent,
+                    'packets_recv': network_io.packets_recv,
+                    'interfaces': list(network_interfaces.keys())
+                },
+                'processes': {
+                    'count': process_count,
+                    'running': len([p for p in psutil.process_iter() if p.status() == 'running'])
+                },
+                'gpu': gpu_metrics
             }
             
-            # Check for alerts
-            self._check_backup_alerts(backup_id, duration_seconds, size_bytes)
+            # Update Prometheus metrics
+            self._update_prometheus_metrics(metrics)
             
-            self.logger.info(f"Recorded backup operation: {backup_id}")
+            # Store in history
+            self.metrics_history.append(metrics)
+            if len(self.metrics_history) > 1000:  # Keep only last 1000 entries
+                self.metrics_history.pop(0)
+            
+            # Check for alerts
+            self._check_alerts(metrics)
+            
+            return metrics
             
         except Exception as e:
-            self.logger.error(f"Failed to record backup operation: {str(e)}")
+            self.logger.error(f"Error collecting system metrics: {e}")
+            return {}
     
-    def record_recovery_operation(self, recovery_id: str, recovery_type: str,
-                                duration_seconds: float, status: str,
-                                backup_id: Optional[str] = None):
-        """Record recovery operation metrics"""
-        if not self.config.enable_recovery_metrics:
-            return
+    def _update_prometheus_metrics(self, metrics: Dict[str, Any]):
+        """Update Prometheus metrics with collected data"""
+        try:
+            # Update existing metrics
+            CPU_USAGE.set(metrics['cpu']['percent'])
+            MEMORY_USAGE.set(metrics['memory']['used'])
+            
+            # Update new metrics
+            PROCESS_COUNT.set(metrics['processes']['count'])
+            
+            # System load
+            for period, value in [('1min', metrics['cpu']['load_average']['1min']),
+                                 ('5min', metrics['cpu']['load_average']['5min']),
+                                 ('15min', metrics['cpu']['load_average']['15min'])]:
+                SYSTEM_LOAD.labels(period=period).set(value)
+            
+            # Disk usage
+            for mount_point, usage in metrics['disk'].items():
+                DISK_USAGE.labels(mount_point=mount_point).set(usage['used'])
+            
+            # Network I/O
+            NETWORK_IO.labels(direction='sent').set(metrics['network']['bytes_sent'])
+            NETWORK_IO.labels(direction='recv').set(metrics['network']['bytes_recv'])
+            
+            # GPU metrics
+            for gpu_name, gpu_data in metrics['gpu'].items():
+                GPU_MEMORY_USAGE.set(gpu_data['memory_allocated'])
+            
+        except Exception as e:
+            self.logger.error(f"Error updating Prometheus metrics: {e}")
+    
+    def _check_alerts(self, metrics: Dict[str, Any]):
+        """Check metrics against thresholds and generate alerts"""
+        try:
+            # CPU usage alert
+            if metrics['cpu']['percent'] > self.alert_thresholds['cpu_usage']:
+                self.create_alert(
+                    severity='warning',
+                    alert_type='cpu_usage',
+                    message=f"CPU usage is {metrics['cpu']['percent']:.1f}%",
+                    source='system_monitor'
+                )
+            
+            # Memory usage alert
+            if metrics['memory']['percent'] > self.alert_thresholds['memory_usage']:
+                self.create_alert(
+                    severity='warning',
+                    alert_type='memory_usage',
+                    message=f"Memory usage is {metrics['memory']['percent']:.1f}%",
+                    source='system_monitor'
+                )
+            
+            # Disk usage alert
+            for mount_point, usage in metrics['disk'].items():
+                if usage['percent'] > self.alert_thresholds['disk_usage']:
+                    self.create_alert(
+                        severity='critical',
+                        alert_type='disk_usage',
+                        message=f"Disk usage for {mount_point} is {usage['percent']:.1f}%",
+                        source='system_monitor'
+                    )
+            
+            # System load alert
+            if metrics['cpu']['load_average']['1min'] > metrics['cpu']['count']:
+                self.create_alert(
+                    severity='warning',
+                    alert_type='system_load',
+                    message=f"System load ({metrics['cpu']['load_average']['1min']:.2f}) exceeds CPU count ({metrics['cpu']['count']})",
+                    source='system_monitor'
+                )
+            
+        except Exception as e:
+            self.logger.error(f"Error checking alerts: {e}")
+    
+    def create_alert(self, severity: str, alert_type: str, message: str, source: str):
+        """Create a new alert"""
+        alert = Alert(
+            timestamp=datetime.now(),
+            severity=severity,
+            type=alert_type,
+            message=message,
+            source=source
+        )
+        
+        self.alerts.append(alert)
+        
+        # Update alert counter
+        ALERT_COUNT.labels(severity=severity, type=alert_type).inc()
+        
+        # Log alert
+        self.logger.warning(f"ALERT [{severity.upper()}] {alert_type}: {message}")
+        
+        # Keep only last 1000 alerts
+        if len(self.alerts) > 1000:
+            self.alerts.pop(0)
+    
+    def perform_health_check(self, service_name: str, check_url: str = None) -> HealthCheck:
+        """Perform health check for a service"""
+        start_time = time.time()
+        status = 'healthy'
+        error_message = None
+        metrics = {}
         
         try:
-            # Update Prometheus metrics
-            RECOVERY_OPERATIONS.labels(recovery_type=recovery_type, status=status).inc()
-            RECOVERY_DURATION.labels(recovery_type=recovery_type).observe(duration_seconds)
+            if check_url:
+                # Perform HTTP health check
+                import requests
+                response = requests.get(check_url, timeout=10)
+                response_time = time.time() - start_time
+                
+                if response.status_code != 200:
+                    status = 'unhealthy'
+                    error_message = f"HTTP {response.status_code}"
+                
+                if response_time > self.alert_thresholds['response_time']:
+                    status = 'degraded'
+                    error_message = f"Response time: {response_time:.2f}s"
+                
+                metrics = {
+                    'response_time': response_time,
+                    'status_code': response.status_code
+                }
+            else:
+                # Internal service health check
+                metrics = self.collect_system_metrics()
+                response_time = time.time() - start_time
+                
+                # Check system health
+                if (metrics['cpu']['percent'] > 90 or 
+                    metrics['memory']['percent'] > 95):
+                    status = 'degraded'
+                    error_message = "High resource usage"
+                
+        except Exception as e:
+            status = 'unhealthy'
+            error_message = str(e)
+            response_time = time.time() - start_time
+        
+        health_check = HealthCheck(
+            service_name=service_name,
+            status=status,
+            timestamp=datetime.now(),
+            response_time=response_time,
+            error_message=error_message,
+            metrics=metrics
+        )
+        
+        self.health_checks[service_name] = health_check
+        
+        # Create alert if unhealthy
+        if status == 'unhealthy':
+            self.create_alert(
+                severity='critical',
+                alert_type='service_health',
+                message=f"Service {service_name} is unhealthy: {error_message}",
+                source='health_check'
+            )
+        elif status == 'degraded':
+            self.create_alert(
+                severity='warning',
+                alert_type='service_health',
+                message=f"Service {service_name} is degraded: {error_message}",
+                source='health_check'
+            )
+        
+        return health_check
+    
+    def get_overall_health(self) -> Dict[str, Any]:
+        """Get overall system health status"""
+        try:
+            # Collect current metrics
+            metrics = self.collect_system_metrics()
             
-            # Record to database
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            # Perform health checks
+            services = ['api', 'database', 'cache', 'oracle', 'zk_proofs']
+            for service in services:
+                self.perform_health_check(service)
             
-            cursor.execute('''
-                INSERT INTO recovery_metrics 
-                (timestamp, recovery_id, recovery_type, duration_seconds, status, backup_id)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (
-                datetime.now(pytz.UTC).isoformat(),
-                recovery_id,
-                recovery_type,
-                duration_seconds,
-                status,
-                backup_id
-            ))
+            # Calculate overall status
+            total_checks = len(self.health_checks)
+            healthy_checks = sum(1 for check in self.health_checks.values() if check.status == 'healthy')
+            degraded_checks = sum(1 for check in self.health_checks.values() if check.status == 'degraded')
             
-            conn.commit()
-            conn.close()
+            if healthy_checks == total_checks:
+                overall_status = 'healthy'
+            elif degraded_checks > 0:
+                overall_status = 'degraded'
+            else:
+                overall_status = 'unhealthy'
             
-            # Cache metrics
-            self.recovery_metrics_cache[recovery_id] = {
-                'timestamp': datetime.now(pytz.UTC),
-                'recovery_type': recovery_type,
-                'duration_seconds': duration_seconds,
-                'status': status,
-                'backup_id': backup_id
+            return {
+                'status': overall_status,
+                'timestamp': datetime.now().isoformat(),
+                'services': {name: asdict(check) for name, check in self.health_checks.items()},
+                'metrics': metrics,
+                'summary': {
+                    'total_services': total_checks,
+                    'healthy': healthy_checks,
+                    'degraded': degraded_checks,
+                    'unhealthy': total_checks - healthy_checks - degraded_checks
+                }
             }
             
-            # Check for alerts
-            self._check_recovery_alerts(recovery_id, duration_seconds)
-            
-            self.logger.info(f"Recorded recovery operation: {recovery_id}")
-            
         except Exception as e:
-            self.logger.error(f"Failed to record recovery operation: {str(e)}")
+            self.logger.error(f"Error getting overall health: {e}")
+            return {
+                'status': 'error',
+                'timestamp': datetime.now().isoformat(),
+                'error': str(e)
+            }
     
-    def record_disaster_event(self, event_id: str, disaster_level: str,
-                            recovery_time_seconds: float, status: str):
-        """Record disaster event metrics"""
-        if not self.config.enable_disaster_metrics:
-            return
+    def get_active_alerts(self) -> Dict[str, Any]:
+        """Get active alerts"""
+        active_alerts = [alert for alert in self.alerts if not alert.resolved]
         
-        try:
-            # Update Prometheus metrics
-            DISASTER_EVENTS.labels(disaster_level=disaster_level, status=status).inc()
-            DISASTER_RECOVERY_TIME.labels(disaster_level=disaster_level).observe(recovery_time_seconds)
-            
-            # Record to database
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                INSERT INTO disaster_metrics 
-                (timestamp, event_id, disaster_level, recovery_time_seconds, status)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (
-                datetime.now(pytz.UTC).isoformat(),
-                event_id,
-                disaster_level,
-                recovery_time_seconds,
-                status
-            ))
-            
-            conn.commit()
-            conn.close()
-            
-            # Check for alerts
-            self._check_disaster_alerts(event_id, disaster_level, recovery_time_seconds)
-            
-            self.logger.info(f"Recorded disaster event: {event_id}")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to record disaster event: {str(e)}")
+        # Group alerts by severity
+        alerts_by_severity = {
+            'critical': [],
+            'warning': [],
+            'info': []
+        }
+        
+        for alert in active_alerts:
+            alerts_by_severity[alert.severity].append(asdict(alert))
+        
+        return {
+            'timestamp': datetime.now().isoformat(),
+            'total_alerts': len(active_alerts),
+            'alerts_by_severity': alerts_by_severity,
+            'recent_alerts': [asdict(alert) for alert in active_alerts[-10:]]
+        }
     
-    def record_backup_verification(self, backup_id: str, result: str):
-        """Record backup verification result"""
-        try:
-            BACKUP_VERIFICATION_RESULTS.labels(result=result).inc()
-            
-            # Update cached metrics
-            if backup_id in self.backup_metrics_cache:
-                self.backup_metrics_cache[backup_id]['verification_result'] = result
-            
-            self.logger.info(f"Recorded backup verification: {backup_id} - {result}")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to record backup verification: {str(e)}")
+    def get_metrics_history(self, limit: int = 100) -> Dict[str, Any]:
+        """Get metrics history"""
+        return {
+            'timestamp': datetime.now().isoformat(),
+            'limit': limit,
+            'count': len(self.metrics_history),
+            'data': self.metrics_history[-limit:] if self.metrics_history else []
+        }
     
-    def record_recovery_test(self, test_id: str, result: str):
-        """Record recovery test result"""
+    def get_infrastructure_status(self) -> Dict[str, Any]:
+        """Get comprehensive infrastructure status"""
         try:
-            RECOVERY_TEST_RESULTS.labels(result=result).inc()
-            self.logger.info(f"Recorded recovery test: {test_id} - {result}")
+            metrics = self.collect_system_metrics()
             
-        except Exception as e:
-            self.logger.error(f"Failed to record recovery test: {str(e)}")
-    
-    def _check_backup_alerts(self, backup_id: str, duration_seconds: float, size_bytes: float):
-        """Check for backup-related alerts"""
-        try:
-            # Check backup size
-            size_gb = size_bytes / (1024**3)
-            if size_gb > self.config.backup_alert_threshold_gb:
-                self._send_alert(f"Large backup detected: {backup_id} ({size_gb:.2f} GB)")
-            
-            # Check backup duration (if unusually long)
-            if duration_seconds > 7200:  # 2 hours
-                self._send_alert(f"Long backup duration: {backup_id} ({duration_seconds:.0f} seconds)")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to check backup alerts: {str(e)}")
-    
-    def _check_recovery_alerts(self, recovery_id: str, duration_seconds: float):
-        """Check for recovery-related alerts"""
-        try:
-            if duration_seconds > self.config.recovery_alert_threshold_minutes * 60:
-                self._send_alert(f"Long recovery time: {recovery_id} ({duration_seconds:.0f} seconds)")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to check recovery alerts: {str(e)}")
-    
-    def _check_disaster_alerts(self, event_id: str, disaster_level: str, recovery_time_seconds: float):
-        """Check for disaster-related alerts"""
-        try:
-            if disaster_level in ['high', 'critical']:
-                self._send_alert(f"High-level disaster: {event_id} ({disaster_level})")
-            
-            if recovery_time_seconds > self.config.disaster_alert_threshold_minutes * 60:
-                self._send_alert(f"Long disaster recovery: {event_id} ({recovery_time_seconds:.0f} seconds)")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to check disaster alerts: {str(e)}")
-    
-    def _send_alert(self, message: str):
-        """Send monitoring alert"""
-        try:
-            # Log alert
-            self.logger.warning(f"ALERT: {message}")
-            
-            # Here you could integrate with external alerting systems
-            # like PagerDuty, Slack, email, etc.
-            
-        except Exception as e:
-            self.logger.error(f"Failed to send alert: {str(e)}")
-    
-    def get_backup_metrics_summary(self, hours: int = 24) -> Dict[str, Any]:
-        """Get backup metrics summary for the last N hours"""
-        try:
-            cutoff_time = datetime.now(pytz.UTC) - timedelta(hours=hours)
-            
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                SELECT 
-                    backup_type,
-                    status,
-                    COUNT(*) as count,
-                    AVG(duration_seconds) as avg_duration,
-                    AVG(size_bytes) as avg_size,
-                    MAX(size_bytes) as max_size
-                FROM backup_metrics 
-                WHERE timestamp > ?
-                GROUP BY backup_type, status
-            ''', (cutoff_time.isoformat(),))
-            
-            results = cursor.fetchall()
-            conn.close()
-            
-            summary = {}
-            for row in results:
-                backup_type, status, count, avg_duration, avg_size, max_size = row
+            # Get container information
+            container_info = {}
+            try:
+                import docker
+                client = docker.from_env()
+                containers = client.containers.list(all=True)
                 
-                if backup_type not in summary:
-                    summary[backup_type] = {}
+                for container in containers:
+                    container_info[container.name] = {
+                        'status': container.status,
+                        'image': container.image.tags[0] if container.image.tags else 'unknown',
+                        'created': container.attrs['Created'],
+                        'ports': container.ports
+                    }
                 
-                summary[backup_type][status] = {
-                    'count': count,
-                    'avg_duration_seconds': avg_duration,
-                    'avg_size_bytes': avg_size,
-                    'max_size_bytes': max_size
-                }
+                CONTAINER_STATUS.info(container_info)
+            except ImportError:
+                container_info = {'error': 'Docker SDK not available'}
+            except Exception as e:
+                container_info = {'error': str(e)}
             
-            return summary
+            return {
+                'timestamp': datetime.now().isoformat(),
+                'system_metrics': metrics,
+                'containers': container_info,
+                'alerts': {
+                    'active': len([a for a in self.alerts if not a.resolved]),
+                    'total': len(self.alerts)
+                },
+                'health_checks': {name: asdict(check) for name, check in self.health_checks.items()}
+            }
             
         except Exception as e:
-            self.logger.error(f"Failed to get backup metrics summary: {str(e)}")
-            return {}
+            self.logger.error(f"Error getting infrastructure status: {e}")
+            return {
+                'timestamp': datetime.now().isoformat(),
+                'error': str(e)
+            }
     
-    def get_recovery_metrics_summary(self, hours: int = 24) -> Dict[str, Any]:
-        """Get recovery metrics summary for the last N hours"""
-        try:
-            cutoff_time = datetime.now(pytz.UTC) - timedelta(hours=hours)
-            
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                SELECT 
-                    recovery_type,
-                    status,
-                    COUNT(*) as count,
-                    AVG(duration_seconds) as avg_duration
-                FROM recovery_metrics 
-                WHERE timestamp > ?
-                GROUP BY recovery_type, status
-            ''', (cutoff_time.isoformat(),))
-            
-            results = cursor.fetchall()
-            conn.close()
-            
-            summary = {}
-            for row in results:
-                recovery_type, status, count, avg_duration = row
-                
-                if recovery_type not in summary:
-                    summary[recovery_type] = {}
-                
-                summary[recovery_type][status] = {
-                    'count': count,
-                    'avg_duration_seconds': avg_duration
-                }
-            
-            return summary
-            
-        except Exception as e:
-            self.logger.error(f"Failed to get recovery metrics summary: {str(e)}")
-            return {}
+    def track_oracle_request(self, oracle_type: str, status: str, response_time: float = None):
+        """Track oracle request metrics"""
+        ORACLE_REQUEST_COUNT.labels(oracle_type=oracle_type, status=status).inc()
+        
+        if response_time:
+            # Track response time as a histogram
+            pass  # Would need to create oracle response time histogram
     
-    def get_disaster_metrics_summary(self, hours: int = 24) -> Dict[str, Any]:
-        """Get disaster metrics summary for the last N hours"""
-        try:
-            cutoff_time = datetime.now(pytz.UTC) - timedelta(hours=hours)
-            
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                SELECT 
-                    disaster_level,
-                    status,
-                    COUNT(*) as count,
-                    AVG(recovery_time_seconds) as avg_recovery_time
-                FROM disaster_metrics 
-                WHERE timestamp > ?
-                GROUP BY disaster_level, status
-            ''', (cutoff_time.isoformat(),))
-            
-            results = cursor.fetchall()
-            conn.close()
-            
-            summary = {}
-            for row in results:
-                disaster_level, status, count, avg_recovery_time = row
-                
-                if disaster_level not in summary:
-                    summary[disaster_level] = {}
-                
-                summary[disaster_level][status] = {
-                    'count': count,
-                    'avg_recovery_time_seconds': avg_recovery_time
-                }
-            
-            return summary
-            
-        except Exception as e:
-            self.logger.error(f"Failed to get disaster metrics summary: {str(e)}")
-            return {}
+    def track_zk_proof(self, circuit_type: str, operation: str, status: str, verification_time: float = None):
+        """Track ZK proof metrics"""
+        ZK_PROOF_COUNT.labels(circuit_type=circuit_type, operation=operation, status=status).inc()
+        
+        if verification_time:
+            # Track verification time as a histogram
+            pass  # Would need to create ZK verification time histogram
+    
+    def track_database_query(self, query_type: str, duration: float):
+        """Track database query metrics"""
+        DATABASE_QUERY_DURATION.labels(query_type=query_type).observe(duration)
+    
+    def update_cache_hit_rate(self, hit_rate: float):
+        """Update cache hit rate metric"""
+        CACHE_HIT_RATE.set(hit_rate)
+    
+    def update_database_connections(self, connection_count: int):
+        """Update database connection count"""
+        DATABASE_CONNECTIONS.set(connection_count)
+    
+    def update_deployment_status(self, version: str, environment: str, status: str):
+        """Update deployment status"""
+        DEPLOYMENT_STATUS.info({
+            'version': version,
+            'environment': environment,
+            'status': status,
+            'timestamp': datetime.now().isoformat()
+        })
+    
+    def resolve_alert(self, alert_index: int):
+        """Resolve an alert"""
+        if 0 <= alert_index < len(self.alerts):
+            self.alerts[alert_index].resolved = True
+            self.alerts[alert_index].resolved_at = datetime.now()
 
-# Global backup monitoring instance
-backup_monitoring_config = BackupMonitoringConfig()
-backup_monitoring_system = BackupMonitoringSystem(backup_monitoring_config)
+# Global infrastructure monitor instance
+infrastructure_monitor = InfrastructureMonitor()

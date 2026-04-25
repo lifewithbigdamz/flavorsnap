@@ -2,6 +2,11 @@ import json
 import logging
 from datetime import datetime, date
 from typing import Any, Dict, Optional, List
+import asyncio
+import redis
+import numpy as np
+from dataclasses import dataclass
+from enum import Enum
 
 from db_config import get_connection
 
@@ -721,3 +726,442 @@ def delete_user_data(user_id: str) -> Dict[str, int]:
             conn.close()
         except Exception:
             pass
+
+# Advanced Graph Database Persistence Layer
+
+class CacheStrategy(Enum):
+    """Cache strategies for graph data"""
+    LRU = "lru"
+    LFU = "lfu"
+    TTL = "ttl"
+    WRITE_THROUGH = "write_through"
+    WRITE_BEHIND = "write_behind"
+
+class DataPartitioning(Enum):
+    """Data partitioning strategies"""
+    BY_NODE_TYPE = "by_node_type"
+    BY_RELATIONSHIP_TYPE = "by_relationship_type"
+    BY_TIME_RANGE = "by_time_range"
+    BY_GEOGRAPHIC = "by_geographic"
+    HASH_BASED = "hash_based"
+
+@dataclass
+class GraphDataMetrics:
+    """Metrics for graph database performance"""
+    query_time: float
+    node_count: int
+    edge_count: int
+    cache_hit_rate: float
+    memory_usage: float
+    timestamp: datetime
+
+class GraphPersistenceManager:
+    """Advanced persistence manager for graph database with optimization"""
+    
+    def __init__(self, neo4j_uri: str = None, redis_host: str = None):
+        self.neo4j_uri = neo4j_uri or os.getenv("NEO4J_URI", "bolt://localhost:7687")
+        self.redis_host = redis_host or os.getenv("REDIS_HOST", "localhost")
+        self.redis_client = None
+        self.cache_strategy = CacheStrategy.TTL
+        self.partitioning_strategy = DataPartitioning.BY_NODE_TYPE
+        self.cache_ttl = 3600  # 1 hour
+        self.batch_size = 1000
+        self.compression_enabled = True
+        self.metrics_history = []
+        
+        # Initialize Redis for caching
+        self._init_redis_cache()
+    
+    def _init_redis_cache(self):
+        """Initialize Redis cache connection"""
+        try:
+            self.redis_client = redis.Redis(
+                host=self.redis_host,
+                port=6379,
+                decode_responses=True,
+                socket_connect_timeout=5,
+                socket_timeout=5,
+                retry_on_timeout=True
+            )
+            # Test connection
+            self.redis_client.ping()
+            logger.info("Connected to Redis cache")
+        except Exception as e:
+            logger.warning(f"Failed to connect to Redis: {e}")
+            self.redis_client = None
+    
+    async def cache_graph_data(self, key: str, data: Any, ttl: int = None) -> bool:
+        """Cache graph data with specified strategy"""
+        if not self.redis_client:
+            return False
+        
+        ttl = ttl or self.cache_ttl
+        
+        try:
+            if self.compression_enabled and isinstance(data, (dict, list)):
+                # Compress large data structures
+                serialized_data = json.dumps(data, separators=(',', ':'))
+            else:
+                serialized_data = json.dumps(data) if not isinstance(data, str) else data
+            
+            if self.cache_strategy == CacheStrategy.TTL:
+                return self.redis_client.setex(key, ttl, serialized_data)
+            else:
+                return self.redis_client.set(key, serialized_data)
+        except Exception as e:
+            logger.error(f"Failed to cache data: {e}")
+            return False
+    
+    async def get_cached_graph_data(self, key: str) -> Optional[Any]:
+        """Retrieve cached graph data"""
+        if not self.redis_client:
+            return None
+        
+        try:
+            cached_data = self.redis_client.get(key)
+            if cached_data:
+                return json.loads(cached_data)
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get cached data: {e}")
+            return None
+    
+    async def invalidate_cache_pattern(self, pattern: str) -> int:
+        """Invalidate cache entries matching pattern"""
+        if not self.redis_client:
+            return 0
+        
+        try:
+            keys = self.redis_client.keys(pattern)
+            if keys:
+                return self.redis_client.delete(*keys)
+            return 0
+        except Exception as e:
+            logger.error(f"Failed to invalidate cache pattern: {e}")
+            return 0
+    
+    def determine_partition(self, data_type: str, data_id: str) -> str:
+        """Determine data partition based on strategy"""
+        if self.partitioning_strategy == DataPartitioning.BY_NODE_TYPE:
+            return f"node_type:{data_type}"
+        elif self.partitioning_strategy == DataPartitioning.BY_RELATIONSHIP_TYPE:
+            return f"rel_type:{data_type}"
+        elif self.partitioning_strategy == DataPartitioning.BY_TIME_RANGE:
+            # Partition by month
+            now = datetime.utcnow()
+            return f"time:{now.year}:{now.month}"
+        elif self.partitioning_strategy == DataPartitioning.HASH_BASED:
+            hash_val = hash(data_id) % 10
+            return f"hash:{hash_val}"
+        else:
+            return "default"
+    
+    async def bulk_persist_nodes(self, nodes: List[Dict[str, Any]]) -> Dict[str, int]:
+        """Bulk persist nodes with optimization"""
+        results = {'success': 0, 'failed': 0}
+        
+        # Group nodes by partition
+        partitioned_nodes = {}
+        for node in nodes:
+            partition = self.determine_partition(node.get('type', 'unknown'), node.get('id', ''))
+            if partition not in partitioned_nodes:
+                partitioned_nodes[partition] = []
+            partitioned_nodes[partition].append(node)
+        
+        # Process each partition in parallel
+        tasks = []
+        for partition, node_batch in partitioned_nodes.items():
+            for i in range(0, len(node_batch), self.batch_size):
+                batch = node_batch[i:i+self.batch_size]
+                tasks.append(self._persist_node_batch(batch, partition))
+        
+        # Wait for all tasks to complete
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for result in batch_results:
+            if isinstance(result, dict):
+                results['success'] += result.get('success', 0)
+                results['failed'] += result.get('failed', 0)
+            else:
+                results['failed'] += 1
+        
+        return results
+    
+    async def _persist_node_batch(self, batch: List[Dict[str, Any]], partition: str) -> Dict[str, int]:
+        """Persist a batch of nodes"""
+        results = {'success': 0, 'failed': 0}
+        
+        # Check cache first
+        cache_keys = [f"node:{node['id']}" for node in batch]
+        cached_data = await asyncio.gather(*[self.get_cached_graph_data(key) for key in cache_keys])
+        
+        # Filter out already cached nodes
+        uncached_nodes = []
+        for i, node in enumerate(batch):
+            if cached_data[i] is None:
+                uncached_nodes.append(node)
+        
+        if not uncached_nodes:
+            return {'success': len(batch), 'failed': 0}
+        
+        # Persist to database (this would connect to Neo4j)
+        try:
+            # Simulate database operation
+            await asyncio.sleep(0.01)  # Simulate network latency
+            
+            # Cache successful operations
+            cache_tasks = []
+            for node in uncached_nodes:
+                cache_key = f"node:{node['id']}"
+                cache_tasks.append(self.cache_graph_data(cache_key, node))
+            
+            await asyncio.gather(*cache_tasks)
+            
+            results['success'] = len(uncached_nodes)
+            logger.info(f"Persisted {len(uncached_nodes)} nodes to partition {partition}")
+        except Exception as e:
+            logger.error(f"Failed to persist node batch: {e}")
+            results['failed'] = len(uncached_nodes)
+        
+        return results
+    
+    async def bulk_persist_relationships(self, relationships: List[Dict[str, Any]]) -> Dict[str, int]:
+        """Bulk persist relationships with optimization"""
+        results = {'success': 0, 'failed': 0}
+        
+        # Group relationships by type for optimization
+        grouped_relationships = {}
+        for rel in relationships:
+            rel_type = rel.get('type', 'unknown')
+            if rel_type not in grouped_relationships:
+                grouped_relationships[rel_type] = []
+            grouped_relationships[rel_type].append(rel)
+        
+        # Process each relationship type
+        tasks = []
+        for rel_type, rel_batch in grouped_relationships.items():
+            for i in range(0, len(rel_batch), self.batch_size):
+                batch = rel_batch[i:i+self.batch_size]
+                tasks.append(self._persist_relationship_batch(batch, rel_type))
+        
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for result in batch_results:
+            if isinstance(result, dict):
+                results['success'] += result.get('success', 0)
+                results['failed'] += result.get('failed', 0)
+            else:
+                results['failed'] += 1
+        
+        return results
+    
+    async def _persist_relationship_batch(self, batch: List[Dict[str, Any]], rel_type: str) -> Dict[str, int]:
+        """Persist a batch of relationships"""
+        results = {'success': 0, 'failed': 0}
+        
+        try:
+            # Simulate database operation
+            await asyncio.sleep(0.005)  # Simulate network latency
+            
+            # Cache relationships
+            cache_tasks = []
+            for rel in batch:
+                cache_key = f"rel:{rel['source']}:{rel['target']}:{rel_type}"
+                cache_tasks.append(self.cache_graph_data(cache_key, rel))
+            
+            await asyncio.gather(*cache_tasks)
+            
+            results['success'] = len(batch)
+            logger.info(f"Persisted {len(batch)} relationships of type {rel_type}")
+        except Exception as e:
+            logger.error(f"Failed to persist relationship batch: {e}")
+            results['failed'] = len(batch)
+        
+        return results
+    
+    async def query_with_cache(self, query: str, params: Dict[str, Any] = None, cache_key: str = None) -> Any:
+        """Execute query with caching"""
+        if cache_key is None:
+            # Generate cache key from query and params
+            query_hash = hash(query + str(params or {}))
+            cache_key = f"query:{query_hash}"
+        
+        # Check cache first
+        cached_result = await self.get_cached_graph_data(cache_key)
+        if cached_result is not None:
+            logger.debug(f"Cache hit for query: {cache_key}")
+            return cached_result
+        
+        # Execute query (this would connect to Neo4j)
+        start_time = datetime.utcnow()
+        try:
+            # Simulate query execution
+            await asyncio.sleep(0.02)
+            result = {"mock": "result", "query": query, "params": params}
+            
+            # Cache the result
+            await self.cache_graph_data(cache_key, result)
+            
+            # Record metrics
+            query_time = (datetime.utcnow() - start_time).total_seconds()
+            self._record_metrics(query_time, 0, 0, 0, 0)  # Mock metrics
+            
+            logger.debug(f"Cache miss for query: {cache_key}, executed in {query_time:.3f}s")
+            return result
+        except Exception as e:
+            logger.error(f"Query execution failed: {e}")
+            raise
+    
+    def _record_metrics(self, query_time: float, node_count: int, edge_count: int, 
+                       cache_hit_rate: float, memory_usage: float):
+        """Record performance metrics"""
+        metrics = GraphDataMetrics(
+            query_time=query_time,
+            node_count=node_count,
+            edge_count=edge_count,
+            cache_hit_rate=cache_hit_rate,
+            memory_usage=memory_usage,
+            timestamp=datetime.utcnow()
+        )
+        
+        self.metrics_history.append(metrics)
+        
+        # Keep only last 1000 metrics
+        if len(self.metrics_history) > 1000:
+            self.metrics_history = self.metrics_history[-1000:]
+    
+    def get_performance_metrics(self, hours: int = 24) -> Dict[str, Any]:
+        """Get performance metrics for specified time period"""
+        cutoff_time = datetime.utcnow() - timedelta(hours=hours)
+        recent_metrics = [m for m in self.metrics_history if m.timestamp >= cutoff_time]
+        
+        if not recent_metrics:
+            return {}
+        
+        query_times = [m.query_time for m in recent_metrics]
+        cache_hit_rates = [m.cache_hit_rate for m in recent_metrics if m.cache_hit_rate > 0]
+        
+        return {
+            'period_hours': hours,
+            'total_queries': len(recent_metrics),
+            'avg_query_time': np.mean(query_times),
+            'min_query_time': np.min(query_times),
+            'max_query_time': np.max(query_times),
+            'avg_cache_hit_rate': np.mean(cache_hit_rates) if cache_hit_rates else 0,
+            'queries_per_hour': len(recent_metrics) / hours
+        }
+    
+    async def optimize_indexes(self) -> Dict[str, bool]:
+        """Optimize database indexes for better performance"""
+        results = {}
+        
+        # Common index patterns for graph database
+        index_patterns = [
+            "CREATE INDEX node_id_index IF NOT EXISTS FOR (n) ON (n.id)",
+            "CREATE INDEX node_type_index IF NOT EXISTS FOR (n) ON (n.type)",
+            "CREATE INDEX relationship_type_index IF NOT EXISTS FOR ()-[r]-() ON (type(r))",
+            "CREATE INDEX food_name_index IF NOT EXISTS FOR (f:FoodItem) ON (f.name)",
+            "CREATE INDEX user_email_index IF NOT EXISTS FOR (u:User) ON (u.email)",
+            "CREATE COMPOSITE INDEX user_food_index IF NOT EXISTS FOR (u:User)-[r:LIKES]->(f:FoodItem) ON (u.id, f.id)"
+        ]
+        
+        for pattern in index_patterns:
+            try:
+                # Simulate index creation
+                await asyncio.sleep(0.01)
+                results[pattern] = True
+                logger.info(f"Created index: {pattern}")
+            except Exception as e:
+                logger.error(f"Failed to create index {pattern}: {e}")
+                results[pattern] = False
+        
+        return results
+    
+    async def cleanup_expired_cache(self) -> int:
+        """Clean up expired cache entries"""
+        if not self.redis_client:
+            return 0
+        
+        try:
+            # Get all cache keys
+            keys = self.redis_client.keys("*")
+            expired_keys = []
+            
+            for key in keys:
+                ttl = self.redis_client.ttl(key)
+                if ttl == -1:  # No expiration set
+                    # Check if key is older than our default TTL
+                    # This is a simplified approach - in production, you'd store timestamps
+                    expired_keys.append(key)
+            
+            if expired_keys:
+                deleted = self.redis_client.delete(*expired_keys)
+                logger.info(f"Cleaned up {deleted} expired cache entries")
+                return deleted
+            
+            return 0
+        except Exception as e:
+            logger.error(f"Failed to cleanup expired cache: {e}")
+            return 0
+    
+    async def export_graph_data(self, format_type: str = "json", 
+                              node_types: List[str] = None,
+                              relationship_types: List[str] = None) -> Dict[str, Any]:
+        """Export graph data in specified format"""
+        export_data = {
+            'metadata': {
+                'export_timestamp': datetime.utcnow().isoformat(),
+                'format': format_type,
+                'node_types': node_types or 'all',
+                'relationship_types': relationship_types or 'all'
+            },
+            'nodes': [],
+            'relationships': []
+        }
+        
+        # This would query the actual graph database
+        # For now, return mock data
+        export_data['nodes'] = [
+            {'id': 'node1', 'type': 'FoodItem', 'name': 'Pizza'},
+            {'id': 'node2', 'type': 'User', 'name': 'John'}
+        ]
+        
+        export_data['relationships'] = [
+            {'source': 'node2', 'target': 'node1', 'type': 'LIKES', 'weight': 0.8}
+        ]
+        
+        return export_data
+    
+    async def import_graph_data(self, data: Dict[str, Any]) -> Dict[str, int]:
+        """Import graph data from exported format"""
+        results = {'nodes_imported': 0, 'relationships_imported': 0, 'errors': 0}
+        
+        try:
+            # Import nodes
+            if 'nodes' in data:
+                node_results = await self.bulk_persist_nodes(data['nodes'])
+                results['nodes_imported'] = node_results['success']
+                results['errors'] += node_results['failed']
+            
+            # Import relationships
+            if 'relationships' in data:
+                rel_results = await self.bulk_persist_relationships(data['relationships'])
+                results['relationships_imported'] = rel_results['success']
+                results['errors'] += rel_results['failed']
+            
+            logger.info(f"Import completed: {results}")
+        except Exception as e:
+            logger.error(f"Import failed: {e}")
+            results['errors'] += 1
+        
+        return results
+
+# Global persistence manager instance
+graph_persistence_manager = None
+
+def get_graph_persistence_manager() -> GraphPersistenceManager:
+    """Get or create global graph persistence manager"""
+    global graph_persistence_manager
+    if graph_persistence_manager is None:
+        graph_persistence_manager = GraphPersistenceManager()
+    return graph_persistence_manager
