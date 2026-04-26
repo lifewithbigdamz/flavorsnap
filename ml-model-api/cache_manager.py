@@ -17,6 +17,7 @@ from typing import Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta
 import logging
 
+
 logger = logging.getLogger(__name__)
 
 class CacheManager:
@@ -335,3 +336,36 @@ class CacheManager:
 
 # Global cache manager instance
 cache_manager = CacheManager()
+
+
+class CacheManager:
+    """
+    Simple in-memory cache with TTL support.
+    """
+
+    def __init__(self):
+        self.cache: Dict[str, tuple] = {}
+
+    def set(self, key: str, value: Any, ttl: int = 300):
+        expiry = time.time() + ttl
+        self.cache[key] = (value, expiry)
+
+    def get(self, key: str) -> Optional[Any]:
+        if key not in self.cache:
+            return None
+
+        value, expiry = self.cache[key]
+
+        if time.time() > expiry:
+            del self.cache[key]
+            return None
+
+        return value
+
+    def clear(self):
+        self.cache.clear()
+
+    def stats(self):
+        return {
+            "size": len(self.cache)
+        }

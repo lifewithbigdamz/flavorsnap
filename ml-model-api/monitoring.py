@@ -1061,3 +1061,42 @@ class InfrastructureMonitor:
 
 # Global infrastructure monitor instance
 infrastructure_monitor = InfrastructureMonitor()
+
+class PerformanceMonitor:
+    """
+    Tracks system performance metrics.
+    """
+
+    def __init__(self):
+        self.metrics = {
+            "requests": 0,
+            "errors": 0,
+            "db_queries": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+        }
+        self.start_time = time.time()
+
+    def log_request(self):
+        self.metrics["requests"] += 1
+
+    def log_error(self):
+        self.metrics["errors"] += 1
+
+    def log_db_query(self):
+        self.metrics["db_queries"] += 1
+
+    def log_cache_hit(self):
+        self.metrics["cache_hits"] += 1
+
+    def log_cache_miss(self):
+        self.metrics["cache_misses"] += 1
+
+    def uptime(self):
+        return time.time() - self.start_time
+
+    def snapshot(self) -> Dict:
+        return {
+            **self.metrics,
+            "uptime_seconds": self.uptime()
+        }
