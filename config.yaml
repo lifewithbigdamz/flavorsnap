@@ -21,6 +21,8 @@ api:
       - /openapi.json
       - /health
       - /static
+      - /metrics
+      - /monitoring/health
   cors:
     allow_origins:
       - "*"
@@ -31,6 +33,44 @@ api:
 model:
   path: models/best_model.pth
   classes_path: food_classes.txt
+
+# Monitoring configuration
+monitoring:
+  enabled: true
+  metrics_path: /metrics
+  scrape_interval_seconds: 15
+  alert_evaluation_interval_seconds: 30
+
+  prometheus:
+    enabled: true
+    port: 9090
+    retention_days: 30
+
+  grafana:
+    enabled: true
+    port: 3001
+    admin_password: "${GRAFANA_ADMIN_PASSWORD:-admin123}"
+
+  alertmanager:
+    enabled: true
+    port: 9093
+
+  elk:
+    enabled: false  # set to true to enable ELK log aggregation
+    elasticsearch_host: "elasticsearch:9200"
+    kibana_port: 5601
+    logstash_port: 5044
+
+  alerts:
+    cpu_warning_threshold: 80
+    cpu_critical_threshold: 95
+    memory_warning_threshold: 85
+    memory_critical_threshold: 95
+    disk_warning_threshold: 85
+    disk_critical_threshold: 95
+    error_rate_critical_threshold: 0.05
+    inference_latency_p95_warning_seconds: 1.0
+    cache_hit_ratio_warning_threshold: 0.30
 pwa:
   enabled: true
   cache_duration_hours: 24

@@ -25,6 +25,15 @@ from src.core.debounced_classifier import get_debounced_classifier
 
 logger = logging.getLogger(__name__)
 
+# Monitoring integration — imported lazily so the classifier works even
+# when the monitoring package is not installed.
+try:
+    from src.monitoring.metrics_collector import get_metrics_collector
+    from src.monitoring.profiler import get_profiler
+    _MONITORING_AVAILABLE = True
+except ImportError:
+    _MONITORING_AVAILABLE = False
+
 
 class FlavorSnapClassifier:
     """Main classifier class with preprocessing support."""
@@ -74,6 +83,13 @@ class FlavorSnapClassifier:
         # Move to device and set to evaluation mode
         self.model = self.model.to(self.device)
         self.model.eval()
+        
+        # Signal to metrics that the model is loaded
+        if _MONITORING_AVAILABLE:
+            try:
+                get_metrics_collector().set_model_loaded(True)
+            except Exception:
+                pass
     
     @safe_image_operation("image preprocessing")
     def preprocess_image(self, image: Image.Image, preprocessing_params: Optional[Dict[str, Any]] = None) -> Image.Image:
@@ -104,6 +120,9 @@ class FlavorSnapClassifier:
         Returns:
             Dictionary containing classification results and metadata
         """
+        import time as _time
+        _start = _time.perf_counter()
+
         # Validate image first
         is_valid, validation_error = self.validate_image(image)
         if not is_valid:
@@ -130,14 +149,36 @@ class FlavorSnapClassifier:
         input_tensor = input_tensor.to(self.device)
         
         # Perform inference
-        with torch.no_grad():
-            outputs = self.model(input_tensor)
-            probabilities = torch.nn.functional.softmax(outputs, dim=1)
-            
-            # Get top prediction
-            confidence, predicted = torch.max(probabilities, 1)
-            predicted_class = self.class_names[predicted.item()]
-            confidence_score = confidence.item()
+        _inference_start = _time.perf_counter()
+        _inference_success = False
+        predicted_class = "unknown"
+        confidence_score = 0.0
+        try:
+            with torch.no_grad():
+                outputs = self.model(input_tensor)
+                probabilities = torch.nn.functional.softmax(outputs, dim=1)
+                
+                # Get top prediction
+                confidence, predicted = torch.max(probabilities, 1)
+                predicted_class = self.class_names[predicted.item()]
+                confidence_score = confidence.item()
+            _inference_success = True
+        except Exception:
+            raise
+        finally:
+            _inference_duration = _time.perf_counter() - _inference_start
+            if _MONITORING_AVAILABLE:
+                try:
+                    get_metrics_collector().record_inference(
+                        duration_seconds=_inference_duration,
+                        predicted_class=predicted_class,
+                        confidence=confidence_score,
+                        success=_inference_success,
+                    )
+                    if _inference_success:
+                        get_profiler()._record("inference", _inference_duration * 1000)
+                except Exception:
+                    pass
         
         # Get all class probabilities
         all_probabilities = {}
@@ -162,7 +203,9 @@ class FlavorSnapClassifier:
                 'entropy': self._calculate_entropy(all_probabilities),
                 'top_confidence': confidence_score,
                 'average_confidence': np.mean(list(all_probabilities.values())),
-                'confidence_distribution': self._get_confidence_distribution(all_probabilities)
+                'confidence_distribution': self._get_confidence_distribution(all_probabilities),
+                'inference_time_ms': round(_inference_duration * 1000, 3),
+                'total_time_ms': round((_time.perf_counter() - _start) * 1000, 3),
             }
         }
         
