@@ -1515,3 +1515,59 @@ def get_kubernetes_deployment_manager() -> KubernetesDeploymentManager:
     if k8s_deployment_manager is None:
         k8s_deployment_manager = KubernetesDeploymentManager()
     return k8s_deployment_manager
+
+
+class DeploymentManager:
+    """
+    Handles infrastructure deployment via Terraform + Docker.
+    """
+
+    def __init__(self, env: str = "dev"):
+        self.env = env
+
+    def init_terraform(self):
+        return subprocess.run(
+            ["terraform", "init"],
+            cwd="terraform/",
+            capture_output=True,
+            text=True
+        )
+
+    def plan(self):
+        return subprocess.run(
+            ["terraform", "plan", f"-var-file={self.env}.tfvars"],
+            cwd="terraform/",
+            capture_output=True,
+            text=True
+        )
+
+    def apply(self):
+        return subprocess.run(
+            ["terraform", "apply", "-auto-approve", f"-var-file={self.env}.tfvars"],
+            cwd="terraform/",
+            capture_output=True,
+            text=True
+        )
+
+    def destroy(self):
+        return subprocess.run(
+            ["terraform", "destroy", "-auto-approve", f"-var-file={self.env}.tfvars"],
+            cwd="terraform/",
+            capture_output=True,
+            text=True
+        )
+
+    def deploy_docker(self):
+        return subprocess.run(
+            ["docker-compose", "up", "-d"],
+            capture_output=True,
+            text=True
+        )
+
+    def status(self):
+        return subprocess.run(
+            ["terraform", "show"],
+            cwd="terraform/",
+            capture_output=True,
+            text=True
+        )
