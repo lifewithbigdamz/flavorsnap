@@ -38,6 +38,9 @@ from model_inference import model_inference
 # Import Swagger documentation setup
 from swagger_setup import setup_swagger
 
+# Import analytics module
+from analytics import analytics
+
 app = Flask(__name__)
 
 
@@ -225,6 +228,14 @@ def predict():
 # Register all management endpoints
 register_all_endpoints(app, model_registry, ab_test_manager, deployment_manager, model_validator)
 
+# Register NLP endpoints
+try:
+    from nlp_handlers import register_nlp_endpoints
+    register_nlp_endpoints(app)
+    logger.info("NLP endpoints registered successfully")
+except Exception as e:
+    logger.warning(f"Failed to register NLP endpoints: {e}")
+
 
 # =========================
 # ANALYTICS ENDPOINTS
@@ -276,6 +287,90 @@ def get_all_analytics():
         'statsCards': analytics.get_stats_cards(),
         'realTimeActivity': analytics.get_real_time_activity()
     }
+    return jsonify(data)
+
+# =========================
+# TIME SERIES ANALYSIS ENDPOINTS
+# =========================
+
+@app.route('/analytics/timeseries', methods=['GET'])
+def get_timeseries_data():
+    """Get preprocessed time series data"""
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    aggregation = request.args.get('aggregation', 'daily')
+    metric = request.args.get('metric', 'total_requests')
+    
+    data = analytics.get_time_series_data(start_date, end_date, aggregation, metric)
+    return jsonify(data)
+
+@app.route('/analytics/trend', methods=['GET'])
+def analyze_trend():
+    """Analyze trends in time series data"""
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    metric = request.args.get('metric', 'total_requests')
+    method = request.args.get('method', 'linear')
+    
+    data = analytics.analyze_trend(start_date, end_date, metric, method)
+    return jsonify(data)
+
+@app.route('/analytics/seasonality', methods=['GET'])
+def detect_seasonality():
+    """Detect and analyze seasonality"""
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    metric = request.args.get('metric', 'total_requests')
+    model = request.args.get('model', 'additive')
+    period = request.args.get('period', type=int)
+    
+    data = analytics.detect_seasonality(start_date, end_date, metric, model, period)
+    return jsonify(data)
+
+@app.route('/analytics/forecast', methods=['GET'])
+def forecast_metric():
+    """Forecast future values"""
+    metric = request.args.get('metric', 'total_requests')
+    steps = request.args.get('steps', 30, type=int)
+    model = request.args.get('model', 'arima')
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    
+    data = analytics.forecast_metric(metric, steps, model, start_date, end_date)
+    return jsonify(data)
+
+@app.route('/analytics/anomalies', methods=['GET'])
+def detect_anomalies():
+    """Detect anomalies in time series"""
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    metric = request.args.get('metric', 'total_requests')
+    method = request.args.get('method', 'zscore')
+    threshold = request.args.get('threshold', 3.0, type=float)
+    
+    data = analytics.detect_anomalies(start_date, end_date, metric, method, threshold)
+    return jsonify(data)
+
+@app.route('/analytics/visualization', methods=['GET'])
+def get_visualization_data():
+    """Get data formatted for visualization"""
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    metrics = request.args.getlist('metrics')
+    
+    if not metrics:
+        metrics = None
+    
+    data = analytics.get_visualization_data(start_date, end_date, metrics)
+    return jsonify(data)
+
+@app.route('/analytics/performance-metrics', methods=['GET'])
+def get_performance_metrics():
+    """Get comprehensive performance metrics"""
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    
+    data = analytics.get_performance_metrics(start_date, end_date)
     return jsonify(data)
         # Validate and sanitize JSON input if present
         if request.is_json:

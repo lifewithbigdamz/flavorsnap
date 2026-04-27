@@ -3,14 +3,22 @@ from datetime import datetime, timedelta, date
 import json
 from typing import List, Dict, Any, Optional, Tuple
 import logging
+import numpy as np
+import pandas as pd
 
 from db_config import get_connection
+from time_series import TimeSeriesPreprocessor, TimeSeriesDecomposer
+from trend_analysis import TrendAnalyzer
+from forecasting import TimeSeriesForecaster
 
 logger = logging.getLogger(__name__)
 
 class AnalyticsAPI:
     def __init__(self):
-        pass
+        self.ts_preprocessor = TimeSeriesPreprocessor()
+        self.ts_decomposer = TimeSeriesDecomposer()
+        self.trend_analyzer = TrendAnalyzer()
+        self.forecaster = TimeSeriesForecaster()
 
     def _execute_query(self, query: str, params: Tuple = None, fetch: bool = True) -> Optional[List[Tuple]]:
         """Execute a database query with error handling."""
@@ -390,49 +398,512 @@ class AnalyticsAPI:
         export_data['statsCards'] = self.get_stats_cards()
 
         return export_data
-
-analytics = AnalyticsAPI()
-                'value': '12,847',
-                'change': '+12.5%',
-                'icon': 'activity',
-                'color': 'bg-blue-500'
-            },
-            {
-                'title': 'Active Users',
-                'value': '3,421',
-                'change': '+8.2%',
-                'icon': 'users',
-                'color': 'bg-green-500'
-            },
-            {
-                'title': 'Avg Accuracy',
-                'value': '94.2%',
-                'change': '+2.1%',
-                'icon': 'check-circle',
-                'color': 'bg-purple-500'
-            },
-            {
-                'title': 'Response Time',
-                'value': '234ms',
-                'change': '-15ms',
-                'icon': 'clock',
-                'color': 'bg-orange-500'
-            }
-        ]
     
-    def export_data(self, start_date=None, end_date=None):
-        export_data = {
-            'usageData': self.get_usage_stats(start_date, end_date),
-            'modelPerformance': self.get_model_performance(),
-            'userEngagement': self.get_user_engagement(),
-            'statsCards': self.get_stats_cards(),
-            'realTimeActivity': self.get_real_time_activity(),
-            'exportDate': datetime.now().isoformat(),
-            'dateRange': {
-                'start': start_date,
-                'end': end_date
+    # ==================== TIME SERIES ANALYSIS METHODS ====================
+    
+    def get_time_series_data(self, start_date: Optional[str] = None,
+                            end_date: Optional[str] = None,
+                            aggregation: str = 'daily',
+                            metric: str = 'total_requests') -> Dict[str, Any]:
+        """
+        Get preprocessed time series data
+        
+        Args:
+            start_date: Start date (YYYY-MM-DD)
+            end_date: End date (YYYY-MM-DD)
+            aggregation: Time aggregation ('hourly', 'daily', 'weekly', 'monthly')
+            metric: Metric to analyze
+        
+        Returns:
+            Time series data with preprocessing applied
+        """
+        try:
+            conn = get_connection()
+            if not conn:
+                return {'error': 'Database connection unavailable'}
+            
+            # Load data
+            df = self.ts_preprocessor.load_data_from_db(conn, start_date, end_date, aggregation)
+            conn.close()
+            
+            if df.empty:
+                return {'error': 'No data available for the specified period'}
+            
+            # Handle missing values
+            df = self.ts_preprocessor.handle_missing_values(df, strategy='interpolate')
+            
+            # Detect outliers
+            df, outlier_counts = self.ts_preprocessor.detect_and_remove_outliers(
+                df, columns=[metric], method='zscore', threshold=3.0, remove=False
+            )
+            
+            # Create time features
+            df = self.ts_preprocessor.create_time_features(df)
+            
+            # Convert to serializable format
+            result = {
+                'data': df[metric].to_dict(),
+                'timestamps': [ts.isoformat() for ts in df.index],
+                'statistics': {
+                    'mean': float(df[metric].mean()),
+                    'median': float(df[metric].median()),
+                    'std': float(df[metric].std()),
+                    'min': float(df[metric].min()),
+                    'max': float(df[metric].max()),
+                    'count': len(df)
+                },
+                'outliers': outlier_counts,
+                'aggregation': aggregation,
+                'metric': metric
             }
-        }
-        return export_data
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting time series data: {e}")
+            return {'error': str(e)}
+    
+    def analyze_trend(self, start_date: Optional[str] = None,
+                     end_date: Optional[str] = None,
+                     metric: str = 'total_requests',
+                     method: str = 'linear') -> Dict[str, Any]:
+        """
+        Analyze trends in time series data
+        
+        Args:
+            start_date: Start date
+            end_date: End date
+            metric: Metric to analyze
+            method: Trend detection method ('linear', 'polynomial', 'exponential', 'moving_average')
+        
+        Returns:
+            Trend analysis results
+        """
+        try:
+            conn = get_connection()
+            if not conn:
+                return {'error': 'Database connection unavailable'}
+            
+            # Load data
+            df = self.ts_preprocessor.load_data_from_db(conn, start_date, end_date, 'daily')
+            conn.close()
+            
+            if df.empty or metric not in df.columns:
+                return {'error': f'No data available for metric: {metric}'}
+            
+            series = df[metric]
+            
+            # Detect trend
+            trend_info = self.trend_analyzer.detect_trend(series, method=method)
+            
+            # Calculate trend strength
+            strength_info = self.trend_analyzer.calculate_trend_strength(series)
+            
+            # Identify change points
+            change_points = self.trend_analyzer.identify_change_points(series, min_size=5, penalty=1.0)
+            
+            # Identify peaks and troughs
+            peaks_troughs = self.trend_analyzer.identify_peaks_and_troughs(series, prominence=0.1)
+            
+            # Serialize trend line if present
+            if 'trend_line' in trend_info and isinstance(trend_info['trend_line'], pd.Series):
+                trend_info['trend_line'] = {
+                    'values': trend_info['trend_line'].tolist(),
+                    'timestamps': [ts.isoformat() for ts in trend_info['trend_line'].index]
+                }
+            
+            result = {
+                'metric': metric,
+                'period': {
+                    'start': start_date or (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d'),
+                    'end': end_date or datetime.now().strftime('%Y-%m-%d')
+                },
+                'trend': trend_info,
+                'strength': strength_info,
+                'change_points': change_points,
+                'peaks_and_troughs': peaks_troughs,
+                'data_points': len(series)
+            }
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error analyzing trend: {e}")
+            return {'error': str(e)}
+    
+    def detect_seasonality(self, start_date: Optional[str] = None,
+                          end_date: Optional[str] = None,
+                          metric: str = 'total_requests',
+                          model: str = 'additive',
+                          period: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Detect and analyze seasonality in time series
+        
+        Args:
+            start_date: Start date
+            end_date: End date
+            metric: Metric to analyze
+            model: Decomposition model ('additive' or 'multiplicative')
+            period: Seasonal period (auto-detected if None)
+        
+        Returns:
+            Seasonality analysis results
+        """
+        try:
+            conn = get_connection()
+            if not conn:
+                return {'error': 'Database connection unavailable'}
+            
+            # Load data
+            df = self.ts_preprocessor.load_data_from_db(conn, start_date, end_date, 'daily')
+            conn.close()
+            
+            if df.empty or metric not in df.columns:
+                return {'error': f'No data available for metric: {metric}'}
+            
+            series = df[metric]
+            
+            # Decompose time series
+            components = self.ts_decomposer.decompose(series, model=model, period=period)
+            
+            # Calculate seasonality strength
+            if 'seasonal' in components and 'residual' in components:
+                seasonal_var = np.var(components['seasonal'].dropna())
+                residual_var = np.var(components['residual'].dropna())
+                seasonality_strength = seasonal_var / (seasonal_var + residual_var) if (seasonal_var + residual_var) > 0 else 0
+            else:
+                seasonality_strength = 0
+            
+            # Serialize components
+            result = {
+                'metric': metric,
+                'model': model,
+                'period': period or 7,
+                'seasonality_strength': float(seasonality_strength),
+                'components': {}
+            }
+            
+            for comp_name, comp_series in components.items():
+                if isinstance(comp_series, pd.Series):
+                    result['components'][comp_name] = {
+                        'values': comp_series.tolist(),
+                        'timestamps': [ts.isoformat() for ts in comp_series.index],
+                        'mean': float(comp_series.mean()),
+                        'std': float(comp_series.std())
+                    }
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error detecting seasonality: {e}")
+            return {'error': str(e)}
+    
+    def forecast_metric(self, metric: str = 'total_requests',
+                       steps: int = 30,
+                       model: str = 'arima',
+                       start_date: Optional[str] = None,
+                       end_date: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Forecast future values of a metric
+        
+        Args:
+            metric: Metric to forecast
+            steps: Number of steps to forecast
+            model: Forecasting model ('arima', 'sarima', 'exp_smoothing', 'prophet', 'ensemble')
+            start_date: Historical data start date
+            end_date: Historical data end date
+        
+        Returns:
+            Forecast results with confidence intervals
+        """
+        try:
+            conn = get_connection()
+            if not conn:
+                return {'error': 'Database connection unavailable'}
+            
+            # Load historical data
+            df = self.ts_preprocessor.load_data_from_db(conn, start_date, end_date, 'daily')
+            conn.close()
+            
+            if df.empty or metric not in df.columns:
+                return {'error': f'No data available for metric: {metric}'}
+            
+            series = df[metric]
+            
+            # Generate forecast based on model
+            if model == 'arima':
+                forecast_result = self.forecaster.forecast_arima(series, steps=steps)
+            elif model == 'sarima':
+                forecast_result = self.forecaster.forecast_sarima(series, steps=steps)
+            elif model == 'exp_smoothing':
+                forecast_result = self.forecaster.forecast_exponential_smoothing(series, steps=steps)
+            elif model == 'prophet':
+                forecast_result = self.forecaster.forecast_prophet(series, steps=steps)
+            elif model == 'ensemble':
+                forecast_result = self.forecaster.ensemble_forecast(series, steps=steps)
+            else:
+                return {'error': f'Unknown model: {model}'}
+            
+            if 'error' in forecast_result:
+                return forecast_result
+            
+            # Serialize forecast results
+            result = {
+                'metric': metric,
+                'model': forecast_result.get('model', model),
+                'steps': steps,
+                'forecast': {},
+                'historical': {}
+            }
+            
+            # Serialize forecast
+            if 'forecast' in forecast_result and isinstance(forecast_result['forecast'], pd.Series):
+                result['forecast'] = {
+                    'values': forecast_result['forecast'].tolist(),
+                    'timestamps': [ts.isoformat() for ts in forecast_result['forecast'].index]
+                }
+            
+            # Serialize confidence intervals if available
+            if 'lower_bound' in forecast_result and isinstance(forecast_result['lower_bound'], pd.Series):
+                result['lower_bound'] = {
+                    'values': forecast_result['lower_bound'].tolist(),
+                    'timestamps': [ts.isoformat() for ts in forecast_result['lower_bound'].index]
+                }
+            
+            if 'upper_bound' in forecast_result and isinstance(forecast_result['upper_bound'], pd.Series):
+                result['upper_bound'] = {
+                    'values': forecast_result['upper_bound'].tolist(),
+                    'timestamps': [ts.isoformat() for ts in forecast_result['upper_bound'].index]
+                }
+            
+            # Serialize historical data
+            if 'historical' in forecast_result and isinstance(forecast_result['historical'], pd.Series):
+                result['historical'] = {
+                    'values': forecast_result['historical'].tolist(),
+                    'timestamps': [ts.isoformat() for ts in forecast_result['historical'].index]
+                }
+            
+            # Add model-specific info
+            for key in ['aic', 'bic', 'order', 'seasonal_order', 'models_used', 'weights']:
+                if key in forecast_result:
+                    result[key] = forecast_result[key]
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error forecasting metric: {e}")
+            return {'error': str(e)}
+    
+    def detect_anomalies(self, start_date: Optional[str] = None,
+                        end_date: Optional[str] = None,
+                        metric: str = 'total_requests',
+                        method: str = 'zscore',
+                        threshold: float = 3.0) -> Dict[str, Any]:
+        """
+        Detect anomalies in time series data
+        
+        Args:
+            start_date: Start date
+            end_date: End date
+            metric: Metric to analyze
+            method: Detection method ('zscore', 'iqr', 'isolation_forest')
+            threshold: Threshold for anomaly detection
+        
+        Returns:
+            Detected anomalies with details
+        """
+        try:
+            conn = get_connection()
+            if not conn:
+                return {'error': 'Database connection unavailable'}
+            
+            # Load data
+            df = self.ts_preprocessor.load_data_from_db(conn, start_date, end_date, 'daily')
+            conn.close()
+            
+            if df.empty or metric not in df.columns:
+                return {'error': f'No data available for metric: {metric}'}
+            
+            # Detect outliers (anomalies)
+            df_with_outliers, outlier_counts = self.ts_preprocessor.detect_and_remove_outliers(
+                df, columns=[metric], method=method, threshold=threshold, remove=False
+            )
+            
+            # Extract anomalies
+            outlier_col = f'{metric}_outlier'
+            if outlier_col in df_with_outliers.columns:
+                anomalies = df_with_outliers[df_with_outliers[outlier_col] == True]
+                
+                anomaly_list = []
+                for idx, row in anomalies.iterrows():
+                    anomaly_list.append({
+                        'timestamp': idx.isoformat(),
+                        'value': float(row[metric]),
+                        'expected_range': {
+                            'mean': float(df[metric].mean()),
+                            'std': float(df[metric].std())
+                        },
+                        'deviation': float(abs(row[metric] - df[metric].mean()) / df[metric].std()) if df[metric].std() > 0 else 0
+                    })
+                
+                result = {
+                    'metric': metric,
+                    'method': method,
+                    'threshold': threshold,
+                    'total_anomalies': len(anomaly_list),
+                    'anomaly_rate': len(anomaly_list) / len(df) * 100 if len(df) > 0 else 0,
+                    'anomalies': anomaly_list,
+                    'statistics': {
+                        'total_points': len(df),
+                        'mean': float(df[metric].mean()),
+                        'std': float(df[metric].std()),
+                        'min': float(df[metric].min()),
+                        'max': float(df[metric].max())
+                    }
+                }
+                
+                return result
+            else:
+                return {'error': 'Anomaly detection failed'}
+                
+        except Exception as e:
+            logger.error(f"Error detecting anomalies: {e}")
+            return {'error': str(e)}
+    
+    def get_visualization_data(self, start_date: Optional[str] = None,
+                              end_date: Optional[str] = None,
+                              metrics: Optional[List[str]] = None) -> Dict[str, Any]:
+        """
+        Get data formatted for visualization
+        
+        Args:
+            start_date: Start date
+            end_date: End date
+            metrics: List of metrics to include
+        
+        Returns:
+            Visualization-ready data
+        """
+        try:
+            if metrics is None:
+                metrics = ['total_requests', 'avg_confidence', 'avg_processing_time', 'success_rate']
+            
+            conn = get_connection()
+            if not conn:
+                return {'error': 'Database connection unavailable'}
+            
+            # Load data
+            df = self.ts_preprocessor.load_data_from_db(conn, start_date, end_date, 'daily')
+            conn.close()
+            
+            if df.empty:
+                return {'error': 'No data available'}
+            
+            # Prepare visualization data
+            result = {
+                'timestamps': [ts.isoformat() for ts in df.index],
+                'metrics': {}
+            }
+            
+            for metric in metrics:
+                if metric in df.columns:
+                    # Get raw data
+                    raw_values = df[metric].tolist()
+                    
+                    # Get smoothed data
+                    smoothed = self.ts_preprocessor.smooth_series(df, metric, method='moving_average', window=7)
+                    
+                    # Get trend
+                    trend_info = self.trend_analyzer.detect_trend(df[metric], method='linear')
+                    trend_line = []
+                    if 'trend_line' in trend_info and isinstance(trend_info['trend_line'], pd.Series):
+                        trend_line = trend_info['trend_line'].tolist()
+                    
+                    result['metrics'][metric] = {
+                        'raw': raw_values,
+                        'smoothed': smoothed.tolist(),
+                        'trend': trend_line,
+                        'statistics': {
+                            'mean': float(df[metric].mean()),
+                            'median': float(df[metric].median()),
+                            'min': float(df[metric].min()),
+                            'max': float(df[metric].max()),
+                            'std': float(df[metric].std())
+                        },
+                        'trend_direction': trend_info.get('direction', 'unknown')
+                    }
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting visualization data: {e}")
+            return {'error': str(e)}
+    
+    def get_performance_metrics(self, start_date: Optional[str] = None,
+                               end_date: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Get comprehensive performance metrics with time series analysis
+        
+        Args:
+            start_date: Start date
+            end_date: End date
+        
+        Returns:
+            Performance metrics with trends and forecasts
+        """
+        try:
+            conn = get_connection()
+            if not conn:
+                return {'error': 'Database connection unavailable'}
+            
+            # Load data
+            df = self.ts_preprocessor.load_data_from_db(conn, start_date, end_date, 'daily')
+            conn.close()
+            
+            if df.empty:
+                return {'error': 'No data available'}
+            
+            # Analyze key metrics
+            metrics_analysis = {}
+            key_metrics = ['total_requests', 'avg_confidence', 'avg_processing_time', 'success_rate']
+            
+            for metric in key_metrics:
+                if metric in df.columns:
+                    series = df[metric]
+                    
+                    # Trend analysis
+                    trend = self.trend_analyzer.detect_trend(series, method='linear')
+                    
+                    # Recent vs historical comparison
+                    if len(series) >= 14:
+                        recent_period = series.tail(7)
+                        previous_period = series.tail(14).head(7)
+                        
+                        change_pct = ((recent_period.mean() - previous_period.mean()) / previous_period.mean() * 100) if previous_period.mean() != 0 else 0
+                    else:
+                        change_pct = 0
+                    
+                    metrics_analysis[metric] = {
+                        'current_value': float(series.iloc[-1]) if len(series) > 0 else 0,
+                        'mean': float(series.mean()),
+                        'trend_direction': trend.get('direction', 'unknown'),
+                        'trend_strength': trend.get('strength', 0),
+                        'change_percentage': float(change_pct),
+                        'is_improving': change_pct > 0 if metric in ['total_requests', 'avg_confidence', 'success_rate'] else change_pct < 0
+                    }
+            
+            return {
+                'period': {
+                    'start': start_date or (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d'),
+                    'end': end_date or datetime.now().strftime('%Y-%m-%d')
+                },
+                'metrics': metrics_analysis,
+                'data_points': len(df),
+                'generated_at': datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting performance metrics: {e}")
+            return {'error': str(e)}
 
 analytics = AnalyticsAPI()

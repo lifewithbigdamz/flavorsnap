@@ -109,6 +109,31 @@ HEALTH_CHECK_STATUS = Gauge(
     'Overall health check status (1=healthy, 0=unhealthy)'
 )
 
+ETL_JOB_COUNT = Counter(
+    'etl_jobs_total',
+    'Total ETL jobs executed',
+    ['job_name', 'status']
+)
+
+ETL_JOB_DURATION = Histogram(
+    'etl_job_duration_seconds',
+    'Duration of ETL jobs in seconds',
+    ['job_name'],
+    buckets=[1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0]
+)
+
+DATA_QUALITY_SCORE = Gauge(
+    'data_quality_score',
+    'Average data quality score of processed data',
+    ['job_name']
+)
+
+RECORDS_PROCESSED = Counter(
+    'etl_records_processed_total',
+    'Total number of records processed by ETL jobs',
+    ['job_name']
+)
+
 class MonitoringMiddleware:
     def __init__(self, app: Flask = None):
         self.app = app
