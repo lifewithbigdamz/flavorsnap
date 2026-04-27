@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from PIL import Image
 import io
+from werkzeug.utils import secure_filename
 
 class SecurityConfig:
     """Security configuration class"""

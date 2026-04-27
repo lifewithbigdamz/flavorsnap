@@ -188,7 +188,7 @@ class JWTKeyManager:
                 'is_active': data['is_active'],
                 'key_id': data['key_id']
             }
-            for key_id, data in self.items()
+            for key_id, data in self.keys.items()
         }
 
 

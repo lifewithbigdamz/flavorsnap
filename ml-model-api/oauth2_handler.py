@@ -7,6 +7,7 @@ import json
 import time
 import secrets
 import hashlib
+import base64
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
