@@ -228,6 +228,14 @@ def predict():
 # Register all management endpoints
 register_all_endpoints(app, model_registry, ab_test_manager, deployment_manager, model_validator)
 
+# Register NLP endpoints
+try:
+    from nlp_handlers import register_nlp_endpoints
+    register_nlp_endpoints(app)
+    logger.info("NLP endpoints registered successfully")
+except Exception as e:
+    logger.warning(f"Failed to register NLP endpoints: {e}")
+
 
 # =========================
 # ANALYTICS ENDPOINTS
