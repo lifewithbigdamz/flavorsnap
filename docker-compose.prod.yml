@@ -14,16 +14,34 @@ services:
       - NEXT_PUBLIC_API_URL=http://backend:5000
       - NEXT_PUBLIC_MODEL_ENDPOINT=/predict
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     networks:
       - flavorsnap-network
     restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
     deploy:
+      replicas: 3
       resources:
         limits:
           memory: 512M
+          cpus: '0.5'
         reservations:
           memory: 256M
+          cpus: '0.25'
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+      rollback_config:
+        parallelism: 1
+        delay: 10s
+        order: stop-first
 
   # Production backend ML API service
   backend:
@@ -37,10 +55,17 @@ services:
       - FLASK_ENV=production
       - PYTHONPATH=/app
       - MODEL_CONFIDENCE_THRESHOLD=0.6
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
     volumes:
       - ./uploads:/app/uploads
       - ./logs:/app/logs
       - model_data:/app/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
       - flavorsnap-network
     restart: always
@@ -49,8 +74,9 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 30s
+      start_period: 60s
     deploy:
+      replicas: 2
       resources:
         limits:
           memory: 2G
@@ -58,6 +84,14 @@ services:
         reservations:
           memory: 1G
           cpus: '0.5'
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+      rollback_config:
+        parallelism: 1
+        delay: 10s
+        order: stop-first
 
   # Nginx reverse proxy
   nginx:
@@ -66,21 +100,31 @@ services:
       - "80:80"
       - "443:443"
     volumes:
-      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./docker/ssl:/etc/nginx/ssl:ro
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
       - ./logs/nginx:/var/log/nginx
     depends_on:
-      - frontend
-      - backend
+      frontend:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
     networks:
       - flavorsnap-network
     restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "nginx -t && curl -f http://localhost/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
     deploy:
       resources:
         limits:
           memory: 256M
+          cpus: '0.25'
         reservations:
           memory: 128M
+          cpus: '0.1'
 
   # Redis for caching and session storage
   redis:
@@ -91,12 +135,20 @@ services:
     networks:
       - flavorsnap-network
     restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
     deploy:
       resources:
         limits:
           memory: 512M
+          cpus: '0.5'
         reservations:
           memory: 256M
+          cpus: '0.25'
 
   # PostgreSQL for production data
   postgres:
@@ -111,6 +163,12 @@ services:
     networks:
       - flavorsnap-network
     restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     deploy:
       resources:
         limits:
@@ -138,12 +196,17 @@ services:
     networks:
       - flavorsnap-network
     restart: always
+    depends_on:
+      - backend
+      - frontend
     deploy:
       resources:
         limits:
           memory: 1G
+          cpus: '0.5'
         reservations:
           memory: 512M
+          cpus: '0.25'
 
   # Grafana for visualization
   grafana:
@@ -152,12 +215,184 @@ services:
       - "3001:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
     volumes:
       - grafana_data:/var/lib/grafana
       - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
       - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
     depends_on:
       - prometheus
+    networks:
+      - flavorsnap-network
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.25'
+        reservations:
+          memory: 256M
+          cpus: '0.1'
+
+  # AlertManager for alerting
+  alertmanager:
+    image: prom/alertmanager:latest
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+      - '--web.external-url=http://localhost:9093'
+    networks:
+      - flavorsnap-network
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+
+  # Node Exporter for system metrics
+  node-exporter:
+    image: prom/node-exporter:latest
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    networks:
+      - flavorsnap-network
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 64M
+
+  # cAdvisor for container metrics
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    privileged: true
+    devices:
+      - /dev/kmsg
+    networks:
+      - flavorsnap-network
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+
+  # Loki for log aggregation
+  loki:
+    image: grafana/loki:latest
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./monitoring/loki.yml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - flavorsnap-network
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  # Promtail for log collection
+  promtail:
+    image: grafana/promtail:latest
+    volumes:
+      - ./monitoring/promtail.yml:/etc/promtail/config.yml:ro
+      - ./logs:/var/log/flavorsnap:ro
+      - /var/log:/var/log:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      - loki
+    networks:
+      - flavorsnap-network
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+
+  # Jaeger for distributed tracing
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"
+      - "14268:14268"
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    networks:
+      - flavorsnap-network
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  # Elasticsearch for log storage
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - flavorsnap-network
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+
+  # Kibana for log visualization
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    ports:
+      - "5601:5601"
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    depends_on:
+      - elasticsearch
     networks:
       - flavorsnap-network
     restart: always
@@ -179,6 +414,12 @@ volumes:
     driver: local
   grafana_data:
     driver: local
+  alertmanager_data:
+    driver: local
+  loki_data:
+    driver: local
+  elasticsearch_data:
+    driver: local
 
 networks:
   flavorsnap-network:
@@ -186,3 +427,4 @@ networks:
     ipam:
       config:
         - subnet: 172.20.0.0/16
+          gateway: 172.20.0.1

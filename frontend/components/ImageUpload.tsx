@@ -1,18 +1,34 @@
-import { useRef, useState, useCallback, DragEvent, ChangeEvent, TouchEvent } from 'react';
+import { useRef, useState, useCallback, DragEvent, ChangeEvent, TouchEvent, KeyboardEvent } from 'react';
 import { useTranslation } from 'next-i18next';
+import { AppError } from '../types';
 
 interface ImageUploadProps {
   onImageSelect: (file: File, imageUrl: string) => void;
+  onError?: (error: AppError) => void;
   loading?: boolean;
   disabled?: boolean;
+  uploadProgress?: number; // Progress percentage (0-100)
+  uploadStatus?: string; // Current status of the upload/async operation
 }
 
-export function ImageUpload({ onImageSelect, loading = false, disabled = false }: ImageUploadProps) {
+export function ImageUpload({ onImageSelect, onError, loading = false, disabled = false, uploadProgress, uploadStatus }: ImageUploadProps) {
   const { t } = useTranslation('common');
   const [isDragging, setIsDragging] = useState(false);
   const [isTouching, setIsTouching] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragCounter = useRef(0);
+
+  const getStatusMessage = (status?: string) => {
+    if (!status) return t('processing');
+    switch (status) {
+      case 'starting': return t('status_starting', 'Starting...');
+      case 'uploading': return t('status_uploading', 'Uploading image...');
+      case 'processing': return t('status_processing', 'Analyzing food...');
+      case 'complete': return t('status_complete', 'Analysis complete!');
+      case 'cached': return t('status_cached', 'Retrieved from cache');
+      default: return t('status_processing', 'Processing...');
+    }
+  };
 
   const handleDragEnter = useCallback((e: DragEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -51,9 +67,14 @@ export function ImageUpload({ onImageSelect, loading = false, disabled = false }
       if (file.type.startsWith('image/')) {
         const imageUrl = URL.createObjectURL(file);
         onImageSelect(file, imageUrl);
+      } else {
+        onError?.({
+          message: t('error_invalid_image_type', 'Invalid file type. Please upload an image.'),
+          code: 'INVALID_FILE_TYPE'
+        });
       }
     }
-  }, [onImageSelect, disabled, loading]);
+  }, [onImageSelect, onError, disabled, loading, t]);
 
   const handleTouchStart = useCallback((e: TouchEvent<HTMLDivElement>) => {
     if (disabled || loading) return;
@@ -72,19 +93,45 @@ export function ImageUpload({ onImageSelect, loading = false, disabled = false }
       if (file.type.startsWith('image/')) {
         const imageUrl = URL.createObjectURL(file);
         onImageSelect(file, imageUrl);
+      } else {
+        onError?.({
+          message: t('error_invalid_image_type', 'Invalid file type. Please upload an image.'),
+          code: 'INVALID_FILE_TYPE'
+        });
       }
     }
     // Reset input value to allow selecting the same file again
     if (e.target) {
       e.target.value = '';
     }
-  }, [onImageSelect]);
+  }, [onImageSelect, onError, t]);
 
   const handleClick = useCallback(() => {
     if (!disabled && !loading) {
       fileInputRef.current?.click();
     }
   }, [disabled, loading]);
+
+  const handleKeyDown = useCallback((e: KeyboardEvent<HTMLDivElement>) => {
+    if (disabled || loading) return;
+    
+    // Support Enter and Space keys for activation
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      handleClick();
+    }
+    
+    // Support Escape key to blur focus
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      if (fileInputRef.current) {
+        fileInputRef.current.blur();
+      }
+      e.currentTarget.blur();
+    }
+    
+    // Allow default Tab behavior for navigation
+  }, [disabled, loading, handleClick]);
 
   return (
     <div className="w-full max-w-md mx-auto px-4 sm:px-0">
@@ -108,13 +155,14 @@ export function ImageUpload({ onImageSelect, loading = false, disabled = false }
         onTouchEnd={handleTouchEnd}
         onClick={handleClick}
         role="button"
-        tabIndex={0}
-        aria-label={t('upload_image_area')}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            handleClick();
-          }
-        }}
+        tabIndex={disabled ? -1 : 0}
+        aria-label={t('upload_image_area', 'Image upload area')}
+        aria-describedby={uploadProgress !== undefined && uploadProgress > 0 && uploadProgress < 100 ? 'upload-progress' : undefined}
+        aria-disabled={disabled || loading}
+        aria-pressed={isDragging}
+        aria-busy={loading}
+        onKeyDown={handleKeyDown}
+        data-testid="image-upload-drop-zone"
       >
         <input
           ref={fileInputRef}
@@ -124,6 +172,7 @@ export function ImageUpload({ onImageSelect, loading = false, disabled = false }
           className="hidden"
           disabled={disabled || loading}
           aria-label={t('select_image_file')}
+          tabIndex={-1} // Hide from tab order since parent is focusable
         />
         
         <div className="flex flex-col items-center space-y-3 sm:space-y-4">
@@ -149,25 +198,78 @@ export function ImageUpload({ onImageSelect, loading = false, disabled = false }
           
           <div className="text-center">
             <p className="text-sm sm:text-base font-medium text-gray-700 dark:text-gray-300 mb-1">
-              {loading ? t('processing') : isDragging ? t('drop_image_here') : t('drag_drop_image')}
+              {loading ? getStatusMessage(uploadStatus) : isDragging ? t('drop_image_here') : t('drag_drop_image')}
             </p>
-            <p className="text-xs sm:text-sm text-gray-500 dark:text-gray-500">
-              {t('or_click_to_select')}
-            </p>
+            {!loading && (
+              <p className="text-xs sm:text-sm text-gray-500 dark:text-gray-500">
+                {t('or_click_to_select')}
+              </p>
+            )}
           </div>
         </div>
         
         {/* Mobile-specific hint */}
-        <div className="absolute bottom-2 left-2 right-2 sm:hidden">
-          <p className="text-xs text-gray-400 text-center">
-            {t('tap_to_upload')}
-          </p>
-        </div>
+        {!loading && (
+          <div className="absolute bottom-2 left-2 right-2 sm:hidden">
+            <p className="text-xs text-gray-400 text-center" aria-hidden="true">
+              {t('tap_to_upload')}
+            </p>
+          </div>
+        )}
+        
+        {/* Drag overlay for screen readers */}
+        {isDragging && (
+          <div 
+            className="absolute inset-0 bg-accent/20 rounded-2xl flex items-center justify-center pointer-events-none"
+            aria-live="polite"
+            aria-atomic="true"
+          >
+            <p className="text-accent font-medium text-lg">
+              {t('drop_image_here', 'Drop image here to upload')}
+            </p>
+          </div>
+        )}
       </div>
+      
+      {/* Upload progress bar */}
+      {((uploadProgress !== undefined && uploadProgress > 0) || loading) && (
+        <div className="mt-3">
+          <div className="flex justify-between items-center mb-1">
+            <span className="text-xs font-medium text-gray-500 dark:text-gray-400">
+              {getStatusMessage(uploadStatus)}
+            </span>
+            {uploadProgress !== undefined && (
+              <span className="text-xs font-medium text-accent">
+                {Math.round(uploadProgress)}%
+              </span>
+            )}
+          </div>
+          <div 
+            id="upload-progress"
+            className="h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden"
+            role="progressbar"
+            aria-valuenow={uploadProgress}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-label={t('upload_progress', 'Upload progress: {{progress}}%', { progress: uploadProgress })}
+          >
+            <div 
+              className={`h-full bg-accent transition-all duration-300 ease-out ${uploadProgress === 100 && uploadStatus === 'processing' ? 'animate-pulse' : ''}`}
+              style={{ width: `${uploadProgress ?? 0}%` }}
+            />
+          </div>
+          <div className="sr-only" aria-live="polite" aria-atomic="true">
+            {t('upload_progress_announcement', 'Upload progress: {{progress}}% - {{status}}', { 
+              progress: uploadProgress, 
+              status: getStatusMessage(uploadStatus) 
+            })}
+          </div>
+        </div>
+      )}
       
       {/* File type hint */}
       <div className="mt-3 text-center">
-        <p className="text-xs text-gray-400">
+        <p className="text-xs text-gray-400" role="note" aria-label={t('supported_formats_hint', 'Supported image formats: JPG, PNG, GIF, WebP, HEIC')}>
           {t('supported_formats')}: JPG, PNG, GIF, WebP, HEIC
         </p>
       </div>

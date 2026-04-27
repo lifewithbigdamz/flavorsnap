@@ -9,6 +9,16 @@ from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 from flask import Flask, Response, request, make_response
+from dataclasses import dataclass, asdict
+import pytz
+
+# Optional imports
+try:
+    import redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+    redis = None
 try:
     from persistence import log_prediction_history
 except Exception:
@@ -81,6 +91,51 @@ ACTIVE_CONNECTIONS = Gauge(
     'Number of active connections'
 )
 
+DATABASE_CONNECTIONS = Gauge(
+    'database_connection_pool_active',
+    'Active database connections'
+)
+
+REDIS_CONNECTION_STATUS = Gauge(
+    'redis_connection_status',
+    'Redis connection status (1=connected, 0=disconnected)'
+)
+
+MODEL_LOAD_TIME = Gauge(
+    'model_load_time_seconds',
+    'Time taken to load the model'
+)
+
+HEALTH_CHECK_STATUS = Gauge(
+    'health_check_status',
+    'Overall health check status (1=healthy, 0=unhealthy)'
+)
+
+ETL_JOB_COUNT = Counter(
+    'etl_jobs_total',
+    'Total ETL jobs executed',
+    ['job_name', 'status']
+)
+
+ETL_JOB_DURATION = Histogram(
+    'etl_job_duration_seconds',
+    'Duration of ETL jobs in seconds',
+    ['job_name'],
+    buckets=[1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0]
+)
+
+DATA_QUALITY_SCORE = Gauge(
+    'data_quality_score',
+    'Average data quality score of processed data',
+    ['job_name']
+)
+
+RECORDS_PROCESSED = Counter(
+    'etl_records_processed_total',
+    'Total number of records processed by ETL jobs',
+    ['job_name']
+)
+
 class MonitoringMiddleware:
     def __init__(self, app: Flask = None):
         self.app = app
@@ -103,6 +158,27 @@ class MonitoringMiddleware:
         @app.route('/health/detailed')
         def detailed_health():
             return self._get_detailed_health()
+        
+        # Add individual health check endpoints
+        @app.route('/health/database')
+        def database_health():
+            return self._check_database_health()
+        
+        @app.route('/health/redis')
+        def redis_health():
+            return self._check_redis_health()
+        
+        @app.route('/health/model')
+        def model_health():
+            return self._check_model_health()
+        
+        @app.route('/health/system')
+        def system_health():
+            return self._check_system_health()
+        
+        @app.route('/health/dependencies')
+        def dependencies_health():
+            return self._check_dependencies_health()
     
     def _before_request(self):
         request.start_time = time.time()
@@ -182,6 +258,292 @@ class MonitoringMiddleware:
         }
         
         return health_data
+
+    def _check_database_health(self) -> Dict[str, Any]:
+        """Check database connectivity and performance"""
+        try:
+            # Try to connect to SQLite database (default for this app)
+            db_path = os.environ.get('DATABASE_PATH', 'predictions.db')
+            start_time = time.time()
+            
+            conn = sqlite3.connect(db_path, timeout=5)
+            cursor = conn.cursor()
+            cursor.execute('SELECT 1')
+            cursor.fetchone()
+            conn.close()
+            
+            connection_time = time.time() - start_time
+            
+            # Check database file size and permissions
+            if os.path.exists(db_path):
+                db_size = os.path.getsize(db_path)
+                db_writable = os.access(db_path, os.W_OK)
+            else:
+                db_size = 0
+                db_writable = False
+            
+            DATABASE_CONNECTIONS.set(1)
+            
+            return {
+                'status': 'healthy',
+                'connection_time_ms': round(connection_time * 1000, 2),
+                'database': {
+                    'path': db_path,
+                    'size_bytes': db_size,
+                    'writable': db_writable,
+                    'connected': True
+                }
+            }
+            
+        except Exception as e:
+            DATABASE_CONNECTIONS.set(0)
+            return {
+                'status': 'unhealthy',
+                'error': str(e),
+                'database': {
+                    'connected': False
+                }
+            }
+
+    def _check_redis_health(self) -> Dict[str, Any]:
+        """Check Redis connectivity if available"""
+        if not REDIS_AVAILABLE:
+            REDIS_CONNECTION_STATUS.set(0)
+            return {
+                'status': 'unavailable',
+                'error': 'Redis package not installed',
+                'redis': {
+                    'connected': False,
+                    'available': False
+                }
+            }
+        
+        try:
+            redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379')
+            start_time = time.time()
+            
+            r = redis.from_url(redis_url, socket_timeout=5)
+            r.ping()
+            
+            connection_time = time.time() - start_time
+            info = r.info()
+            
+            REDIS_CONNECTION_STATUS.set(1)
+            
+            return {
+                'status': 'healthy',
+                'connection_time_ms': round(connection_time * 1000, 2),
+                'redis': {
+                    'connected': True,
+                    'available': True,
+                    'version': info.get('redis_version'),
+                    'used_memory': info.get('used_memory_human'),
+                    'connected_clients': info.get('connected_clients'),
+                    'uptime_seconds': info.get('uptime_in_seconds')
+                }
+            }
+            
+        except Exception as e:
+            REDIS_CONNECTION_STATUS.set(0)
+            return {
+                'status': 'unhealthy',
+                'error': str(e),
+                'redis': {
+                    'connected': False,
+                    'available': True
+                }
+            }
+
+    def _check_model_health(self) -> Dict[str, Any]:
+        """Check ML model status and performance"""
+        try:
+            model_path = 'model.pth'
+            model_loaded = os.path.exists(model_path)
+            
+            model_info = {
+                'loaded': model_loaded,
+                'path': model_path,
+                'size_bytes': os.path.getsize(model_path) if model_loaded else 0,
+                'last_modified': os.path.getmtime(model_path) if model_loaded else None
+            }
+            
+            # Check GPU availability and memory
+            gpu_info = {
+                'available': torch.cuda.is_available(),
+                'device_count': torch.cuda.device_count() if torch.cuda.is_available() else 0,
+                'memory_allocated': torch.cuda.memory_allocated() if torch.cuda.is_available() else 0,
+                'memory_cached': torch.cuda.memory_reserved() if torch.cuda.is_available() else 0
+            }
+            
+            # Get model accuracy if available
+            accuracy = MODEL_ACCURACY._value.get() if MODEL_ACCURACY._value else 0.0
+            
+            status = 'healthy' if model_loaded else 'unhealthy'
+            
+            return {
+                'status': status,
+                'model': model_info,
+                'gpu': gpu_info,
+                'accuracy': accuracy,
+                'inference_metrics': {
+                    'total_inferences': MODEL_INFERENCE_COUNT._value.get() if MODEL_INFERENCE_COUNT._value else 0,
+                    'average_duration': MODEL_INFERENCE_DURATION.observe if hasattr(MODEL_INFERENCE_DURATION, 'observe') else 0,
+                    'failure_count': MODEL_INFERENCE_FAILURES._value.get() if MODEL_INFERENCE_FAILURES._value else 0
+                }
+            }
+            
+        except Exception as e:
+            return {
+                'status': 'unhealthy',
+                'error': str(e),
+                'model': {
+                    'loaded': False
+                }
+            }
+
+    def _check_system_health(self) -> Dict[str, Any]:
+        """Check system resources and performance"""
+        try:
+            # CPU information
+            cpu_percent = psutil.cpu_percent(interval=1)
+            cpu_count = psutil.cpu_count()
+            cpu_freq = psutil.cpu_freq()
+            
+            # Memory information
+            memory = psutil.virtual_memory()
+            swap = psutil.swap_memory()
+            
+            # Disk information
+            disk = psutil.disk_usage('/')
+            disk_io = psutil.disk_io_counters()
+            
+            # Network information
+            network_io = psutil.net_io_counters()
+            
+            # Process information
+            process = psutil.Process()
+            process_memory = process.memory_info()
+            
+            # Temperature if available
+            temps = {}
+            try:
+                temps = psutil.sensors_temperatures()
+            except AttributeError:
+                pass
+            
+            # Boot time
+            boot_time = psutil.boot_time()
+            
+            return {
+                'status': 'healthy',
+                'timestamp': time.time(),
+                'uptime_seconds': time.time() - boot_time,
+                'cpu': {
+                    'percent': cpu_percent,
+                    'count': cpu_count,
+                    'frequency_mhz': cpu_freq.current if cpu_freq else None,
+                    'load_average': os.getloadavg() if hasattr(os, 'getloadavg') else None
+                },
+                'memory': {
+                    'total': memory.total,
+                    'available': memory.available,
+                    'percent': memory.percent,
+                    'used': memory.used,
+                    'swap_total': swap.total,
+                    'swap_used': swap.used,
+                    'swap_percent': swap.percent
+                },
+                'disk': {
+                    'total': disk.total,
+                    'used': disk.used,
+                    'free': disk.free,
+                    'percent': (disk.used / disk.total) * 100,
+                    'read_bytes': disk_io.read_bytes if disk_io else 0,
+                    'write_bytes': disk_io.write_bytes if disk_io else 0
+                },
+                'network': {
+                    'bytes_sent': network_io.bytes_sent if network_io else 0,
+                    'bytes_recv': network_io.bytes_recv if network_io else 0,
+                    'packets_sent': network_io.packets_sent if network_io else 0,
+                    'packets_recv': network_io.packets_recv if network_io else 0
+                },
+                'process': {
+                    'pid': process.pid,
+                    'memory_rss': process_memory.rss,
+                    'memory_vms': process_memory.vms,
+                    'cpu_percent': process.cpu_percent(),
+                    'num_threads': process.num_threads(),
+                    'create_time': process.create_time()
+                },
+                'temperature': temps
+            }
+            
+        except Exception as e:
+            return {
+                'status': 'unhealthy',
+                'error': str(e)
+            }
+
+    def _check_dependencies_health(self) -> Dict[str, Any]:
+        """Check external dependencies and services"""
+        dependencies = {}
+        
+        # Check Python version
+        dependencies['python'] = {
+            'version': sys.version,
+            'version_info': sys.version_info,
+            'status': 'healthy'
+        }
+        
+        # Check key packages
+        packages = ['flask', 'torch', 'psutil', 'prometheus_client', 'sqlite3']
+        if REDIS_AVAILABLE:
+            packages.append('redis')
+        
+        for package in packages:
+            try:
+                if package == 'sqlite3':
+                    import sqlite3
+                    version = sqlite3.sqlite_version
+                elif package == 'redis':
+                    version = redis.__version__ if redis else 'unknown'
+                else:
+                    module = __import__(package)
+                    version = getattr(module, '__version__', 'unknown')
+                
+                dependencies[package] = {
+                    'version': version,
+                    'status': 'healthy'
+                }
+            except ImportError as e:
+                dependencies[package] = {
+                    'version': None,
+                    'status': 'unhealthy',
+                    'error': str(e)
+                }
+        
+        # Check environment variables
+        required_env_vars = ['SECRET_KEY', 'FLASK_ENV']
+        env_status = {}
+        for var in required_env_vars:
+            env_status[var] = {
+                'set': var in os.environ,
+                'value': os.environ.get(var, '')[:8] + '...' if var in os.environ and var == 'SECRET_KEY' else os.environ.get(var, '')
+            }
+        
+        dependencies['environment'] = env_status
+        
+        # Overall status
+        overall_status = 'healthy'
+        for dep in dependencies.values():
+            if isinstance(dep, dict) and dep.get('status') == 'unhealthy':
+                overall_status = 'degraded'
+                break
+        
+        return {
+            'status': overall_status,
+            'dependencies': dependencies
+        }
 
 def track_inference(func):
     """Decorator to track model inference metrics"""
