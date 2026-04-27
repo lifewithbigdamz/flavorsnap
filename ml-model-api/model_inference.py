@@ -15,6 +15,17 @@ import os
 import logging
 from typing import Dict, List, Tuple, Any, Optional
 import time
+import base64
+import io
+
+# XAI imports
+try:
+    from xai import ModelExplainer
+    from visualization import XAIVisualizer
+    XAI_AVAILABLE = True
+except ImportError:
+    XAI_AVAILABLE = False
+    logging.warning("XAI modules not available. XAI features will be disabled.")
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +55,20 @@ class ModelInference:
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
+        
+        # Initialize XAI components if available
+        self.explainer = None
+        self.visualizer = None
+        if XAI_AVAILABLE:
+            try:
+                self.explainer = ModelExplainer(self.model)
+                self.explainer.class_names = self.classes
+                self.visualizer = XAIVisualizer()
+                logger.info("XAI components initialized successfully")
+            except Exception as e:
+                logger.warning(f"Failed to initialize XAI components: {e}")
+                self.explainer = None
+                self.visualizer = None
 
     def _load_model(self):
         """Load PyTorch model"""
@@ -192,8 +217,221 @@ class ModelInference:
             'classes': self.classes,
             'device': str(self.device),
             'model_path': self.model_path,
-            'classes_path': self.classes_path
+            'classes_path': self.classes_path,
+            'xai_available': XAI_AVAILABLE and self.explainer is not None
         }
+    
+    def predict_with_explanation(self, image_path: str, methods: List[str] = None, 
+                             top_k: int = 3) -> Dict[str, Any]:
+        """
+        Run model prediction with XAI explanations
+        
+        Args:
+            image_path: Path to image file
+            methods: List of XAI methods to use (grad-cam, shap, lime, feature-importance)
+            top_k: Number of top predictions to return
+            
+        Returns:
+            Prediction results with explanations
+        """
+        if not XAI_AVAILABLE or self.explainer is None:
+            return self.predict(image_path, top_k)
+        
+        start_time = time.time()
+        
+        try:
+            # Get basic prediction
+            prediction_result = self.predict(image_path, top_k)
+            
+            if 'error' in prediction_result:
+                return prediction_result
+            
+            # Preprocess image for XAI
+            input_tensor = self.preprocess_image(image_path)
+            
+            # Get model outputs for XAI
+            with torch.no_grad():
+                outputs = self.model(input_tensor)
+                probabilities = torch.nn.functional.softmax(outputs[0], dim=0)
+                predicted_class = torch.argmax(probabilities).item()
+                confidence = probabilities[predicted_class].item()
+            
+            # Default methods if not specified
+            if methods is None:
+                methods = ['grad-cam', 'feature-importance']
+            
+            explanations = {}
+            
+            # Generate explanations for each method
+            for method in methods:
+                try:
+                    if method == 'grad-cam':
+                        heatmap = self.explainer.generate_grad_cam(input_tensor, predicted_class)
+                        original_image = Image.open(image_path).convert('RGB')
+                        overlay_image = self.explainer.create_explanation_overlay(
+                            original_image, heatmap, confidence
+                        )
+                        heatmap_base64 = self.explainer.encode_image_to_base64(overlay_image)
+                        
+                        explanations[method] = {
+                            'heatmap_overlay': f'data:image/png;base64,{heatmap_base64}',
+                            'explanation': f'Grad-CAM highlights regions important for {self.classes[predicted_class] if predicted_class < len(self.classes) else f"Class_{predicted_class}"}'
+                        }
+                    
+                    elif method == 'shap':
+                        shap_result = self.explainer.generate_shap_values(input_tensor, predicted_class)
+                        if 'error' not in shap_result:
+                            explanations[method] = shap_result
+                    
+                    elif method == 'lime':
+                        lime_result = self.explainer.generate_lime_explanation(input_tensor, predicted_class)
+                        if 'error' not in lime_result:
+                            explanations[method] = lime_result
+                    
+                    elif method == 'feature-importance':
+                        importance = self.explainer.generate_feature_importance(input_tensor, 10)
+                        explanations[method] = {
+                            'feature_importance': importance,
+                            'explanation': 'Feature importance using integrated gradients'
+                        }
+                    
+                    elif method == 'confidence':
+                        confidence_data = self.explainer.generate_confidence_explanation(
+                            probabilities, self.classes
+                        )
+                        explanations[method] = confidence_data
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to generate {method} explanation: {e}")
+                    explanations[method] = {'error': str(e)}
+            
+            # Add explanations to prediction result
+            prediction_result['explanations'] = explanations
+            prediction_result['xai_methods_used'] = methods
+            prediction_result['processing_time'] = round(time.time() - start_time, 3)
+            
+            return prediction_result
+            
+        except Exception as e:
+            logger.error(f"Prediction with explanation failed: {e}")
+            return {
+                'error': 'Prediction with explanation failed',
+                'processing_time': round(time.time() - start_time, 3),
+                'predictions': []
+            }
+    
+    def generate_explanation_visualization(self, image_path: str, method: str = 'grad-cam') -> str:
+        """
+        Generate visualization for a specific XAI method
+        
+        Args:
+            image_path: Path to image file
+            method: XAI method to visualize
+            
+        Returns:
+            Base64 encoded image string
+        """
+        if not XAI_AVAILABLE or self.explainer is None or self.visualizer is None:
+            return ""
+        
+        try:
+            # Preprocess image
+            input_tensor = self.preprocess_image(image_path)
+            
+            # Get prediction
+            with torch.no_grad():
+                outputs = self.model(input_tensor)
+                probabilities = torch.nn.functional.softmax(outputs[0], dim=0)
+                predicted_class = torch.argmax(probabilities).item()
+            
+            # Generate explanation based on method
+            if method == 'grad-cam':
+                heatmap = self.explainer.generate_grad_cam(input_tensor, predicted_class)
+                original_image = Image.open(image_path).convert('RGB')
+                overlay_image = self.explainer.create_explanation_overlay(
+                    original_image, heatmap, probabilities[predicted_class].item()
+                )
+                return self.explainer.encode_image_to_base64(overlay_image)
+            
+            elif method == 'shap':
+                shap_result = self.explainer.generate_shap_values(input_tensor, predicted_class)
+                return shap_result.get('shap_image', '')
+            
+            elif method == 'lime':
+                lime_result = self.explainer.generate_lime_explanation(input_tensor, predicted_class)
+                return lime_result.get('lime_image', '')
+            
+            elif method == 'feature-importance':
+                importance = self.explainer.generate_feature_importance(input_tensor, 10)
+                if self.visualizer:
+                    return self.visualizer.create_feature_importance_plot(
+                        importance, title=f"Feature Importance - {method}", method=method
+                    )
+            
+            return ""
+            
+        except Exception as e:
+            logger.error(f"Failed to generate {method} visualization: {e}")
+            return ""
+    
+    def get_xai_capabilities(self) -> Dict[str, Any]:
+        """Get information about available XAI capabilities"""
+        capabilities = {
+            'xai_available': XAI_AVAILABLE and self.explainer is not None,
+            'available_methods': [],
+            'performance_info': {}
+        }
+        
+        if XAI_AVAILABLE and self.explainer is not None:
+            capabilities['available_methods'] = [
+                {
+                    'name': 'grad-cam',
+                    'description': 'Gradient-weighted Class Activation Mapping',
+                    'type': 'visualization',
+                    'speed': 'fast'
+                },
+                {
+                    'name': 'shap',
+                    'description': 'SHapley Additive exPlanations',
+                    'type': 'pixel-level',
+                    'speed': 'slow'
+                },
+                {
+                    'name': 'lime',
+                    'description': 'Local Interpretable Model-agnostic Explanations',
+                    'type': 'region-level',
+                    'speed': 'medium'
+                },
+                {
+                    'name': 'feature-importance',
+                    'description': 'Integrated Gradients Feature Importance',
+                    'type': 'feature-level',
+                    'speed': 'medium'
+                },
+                {
+                    'name': 'confidence',
+                    'description': 'Prediction Confidence Analysis',
+                    'type': 'statistical',
+                    'speed': 'fast'
+                }
+            ]
+            
+            capabilities['performance_info'] = {
+                'recommended_methods': {
+                    'speed': 'grad-cam',
+                    'accuracy': 'shap',
+                    'interpretability': 'shap',
+                    'balance': 'lime'
+                },
+                'memory_requirements': {
+                    'grad-cam': 'low',
+                    'shap': 'high',
+                    'lime': 'medium',
+                    'feature-importance': 'medium'
+                }
+            }
+        
+        return capabilities
 
 
 # Global model inference instance
