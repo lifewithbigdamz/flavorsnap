@@ -1,3 +1,8 @@
+"""
+Advanced Queue Monitoring System for FlavorSnap
+Provides comprehensive monitoring, analytics, and alerting for queue operations
+"""
+
 import time
 import psutil
 import torch
@@ -105,455 +110,230 @@ MODEL_LOAD_TIME = Gauge(
     'model_load_time_seconds',
     'Time taken to load the model'
 )
+import threading
+import json
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, Callable
+from dataclasses import dataclass, field
+from collections import defaultdict, deque
+from enum import Enum
+import logging
+import statistics
 
-HEALTH_CHECK_STATUS = Gauge(
-    'health_check_status',
-    'Overall health check status (1=healthy, 0=unhealthy)'
-)
+logger = logging.getLogger(__name__)
 
-ETL_JOB_COUNT = Counter(
-    'etl_jobs_total',
-    'Total ETL jobs executed',
-    ['job_name', 'status']
-)
+class AlertLevel(Enum):
+    """Alert severity levels"""
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    CRITICAL = "critical"
 
-ETL_JOB_DURATION = Histogram(
-    'etl_job_duration_seconds',
-    'Duration of ETL jobs in seconds',
-    ['job_name'],
-    buckets=[1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0]
-)
+class MetricType(Enum):
+    """Types of metrics to track"""
+    COUNTER = "counter"
+    GAUGE = "gauge"
+    HISTOGRAM = "histogram"
+    TIMER = "timer"
 
-DATA_QUALITY_SCORE = Gauge(
-    'data_quality_score',
-    'Average data quality score of processed data',
-    ['job_name']
-)
+@dataclass
+class Metric:
+    """Metric data point"""
+    name: str
+    value: float
+    timestamp: datetime = field(default_factory=datetime.now)
+    labels: Dict[str, str] = field(default_factory=dict)
+    metric_type: MetricType = MetricType.GAUGE
 
-RECORDS_PROCESSED = Counter(
-    'etl_records_processed_total',
-    'Total number of records processed by ETL jobs',
-    ['job_name']
-)
+@dataclass
+class Alert:
+    """Alert definition"""
+    name: str
+    level: AlertLevel
+    condition: str
+    threshold: float
+    message: str
+    enabled: bool = True
+    last_triggered: Optional[datetime] = None
+    trigger_count: int = 0
 
-class MonitoringMiddleware:
-    def __init__(self, app: Flask = None):
-        self.app = app
-        if app:
-            self.init_app(app)
+@dataclass
+class QueueMetrics:
+    """Queue-specific metrics"""
+    queue_name: str
+    total_tasks: int = 0
+    pending_tasks: int = 0
+    running_tasks: int = 0
+    completed_tasks: int = 0
+    failed_tasks: int = 0
+    average_wait_time: float = 0.0
+    average_processing_time: float = 0.0
+    throughput: float = 0.0  # tasks per second
+    error_rate: float = 0.0  # percentage
+    last_updated: datetime = field(default_factory=datetime.now)
+
+class MetricsCollector:
+    """Collects and stores metrics"""
     
-    def init_app(self, app: Flask):
-        app.before_request(self._before_request)
-        app.after_request(self._after_request)
-        app.teardown_request(self._teardown_request)
-        
-        # Add metrics endpoint
-        @app.route('/metrics')
-        def metrics():
-            # Update system metrics
-            self._update_system_metrics()
-            return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
-        
-        # Add health check with detailed metrics
-        @app.route('/health/detailed')
-        def detailed_health():
-            return self._get_detailed_health()
-        
-        # Add individual health check endpoints
-        @app.route('/health/database')
-        def database_health():
-            return self._check_database_health()
-        
-        @app.route('/health/redis')
-        def redis_health():
-            return self._check_redis_health()
-        
-        @app.route('/health/model')
-        def model_health():
-            return self._check_model_health()
-        
-        @app.route('/health/system')
-        def system_health():
-            return self._check_system_health()
-        
-        @app.route('/health/dependencies')
-        def dependencies_health():
-            return self._check_dependencies_health()
+    def __init__(self, max_history: int = 10000):
+        self.max_history = max_history
+        self._metrics: Dict[str, deque] = defaultdict(lambda: deque(maxlen=max_history))
+        self._counters: Dict[str, float] = defaultdict(float)
+        self._gauges: Dict[str, float] = defaultdict(float)
+        self._lock = threading.RLock()
     
-    def _before_request(self):
-        request.start_time = time.time()
+    def record_counter(self, name: str, value: float = 1.0, labels: Dict[str, str] = None):
+        """Record counter metric"""
+        with self._lock:
+            key = self._make_key(name, labels)
+            self._counters[key] += value
+            metric = Metric(name, self._counters[key], metric_type=MetricType.COUNTER, labels=labels or {})
+            self._metrics[key].append(metric)
     
-    def _after_request(self, response):
-        if hasattr(request, 'start_time'):
-            duration = time.time() - request.start_time
-            
-            # Record request metrics
-            REQUEST_COUNT.labels(
-                method=request.method,
-                endpoint=request.endpoint or 'unknown',
-                status=response.status_code
-            ).inc()
-            
-            REQUEST_DURATION.labels(
-                method=request.method,
-                endpoint=request.endpoint or 'unknown'
-            ).observe(duration)
-        
-        return response
+    def set_gauge(self, name: str, value: float, labels: Dict[str, str] = None):
+        """Set gauge metric"""
+        with self._lock:
+            key = self._make_key(name, labels)
+            self._gauges[key] = value
+            metric = Metric(name, value, metric_type=MetricType.GAUGE, labels=labels or {})
+            self._metrics[key].append(metric)
     
-    def _teardown_request(self, exception):
-        if exception:
-            REQUEST_EXCEPTIONS.labels(
-                method=request.method,
-                endpoint=request.endpoint or 'unknown'
-            ).inc()
+    def record_histogram(self, name: str, value: float, labels: Dict[str, str] = None):
+        """Record histogram metric"""
+        with self._lock:
+            key = self._make_key(name, labels)
+            metric = Metric(name, value, metric_type=MetricType.HISTOGRAM, labels=labels or {})
+            self._metrics[key].append(metric)
     
-    def _update_system_metrics(self):
-        # Update memory usage
-        memory = psutil.virtual_memory()
-        MEMORY_USAGE.set(memory.used)
-        
-        # Update CPU usage
-        CPU_USAGE.set(psutil.cpu_percent())
-        
-        # Update GPU memory if available
-        if torch.cuda.is_available():
-            GPU_MEMORY_USAGE.set(torch.cuda.memory_allocated())
-        
-        # Update active connections (placeholder)
-        ACTIVE_CONNECTIONS.set(1)  # This would need actual connection tracking
+    def record_timer(self, name: str, duration_ms: float, labels: Dict[str, str] = None):
+        """Record timer metric"""
+        with self._lock:
+            key = self._make_key(name, labels)
+            metric = Metric(name, duration_ms, metric_type=MetricType.TIMER, labels=labels or {})
+            self._metrics[key].append(metric)
     
-    def _get_detailed_health(self) -> Dict[str, Any]:
-        memory = psutil.virtual_memory()
-        disk = psutil.disk_usage('/')
+    def _make_key(self, name: str, labels: Dict[str, str] = None) -> str:
+        """Create metric key from name and labels"""
+        if not labels:
+            return name
+        label_str = ",".join(f"{k}={v}" for k, v in sorted(labels.items()))
+        return f"{name}[{label_str}]"
+    
+    def get_metric_history(self, name: str, labels: Dict[str, str] = None, 
+                          since: Optional[datetime] = None) -> List[Metric]:
+        """Get metric history"""
+        with self._lock:
+            key = self._make_key(name, labels)
+            metrics = list(self._metrics[key])
+            
+            if since:
+                metrics = [m for m in metrics if m.timestamp >= since]
+            
+            return metrics
+    
+    def get_current_metrics(self) -> Dict[str, Any]:
+        """Get current metric values"""
+        with self._lock:
+            result = {}
+            
+            # Add counters
+            for key, value in self._counters.items():
+                result[key] = {"type": "counter", "value": value}
+            
+            # Add gauges
+            for key, value in self._gauges.items():
+                result[key] = {"type": "gauge", "value": value}
+            
+            return result
+    
+    def calculate_percentiles(self, name: str, percentiles: List[float] = None,
+                            labels: Dict[str, str] = None) -> Dict[str, float]:
+        """Calculate percentiles for histogram/timer metrics"""
+        if percentiles is None:
+            percentiles = [50.0, 90.0, 95.0, 99.0]
         
-        health_data = {
-            'status': 'healthy',
-            'timestamp': time.time(),
-            'system': {
-                'cpu_percent': psutil.cpu_percent(),
-                'memory': {
-                    'total': memory.total,
-                    'available': memory.available,
-                    'percent': memory.percent,
-                    'used': memory.used
-                },
-                'disk': {
-                    'total': disk.total,
-                    'used': disk.used,
-                    'free': disk.free,
-                    'percent': (disk.used / disk.total) * 100
-                }
-            },
-            'gpu': {
-                'available': torch.cuda.is_available(),
-                'device_count': torch.cuda.device_count() if torch.cuda.is_available() else 0,
-                'memory_allocated': torch.cuda.memory_allocated() if torch.cuda.is_available() else 0,
-                'memory_cached': torch.cuda.memory_reserved() if torch.cuda.is_available() else 0
-            },
-            'model': {
-                'loaded': True,  # This would be set based on actual model state
-                'accuracy': MODEL_ACCURACY._value.get() if MODEL_ACCURACY._value else 0.0
-            }
-        }
+        metrics = self.get_metric_history(name, labels)
+        if not metrics:
+            return {}
         
-        return health_data
-
-    def _check_database_health(self) -> Dict[str, Any]:
-        """Check database connectivity and performance"""
-        try:
-            # Try to connect to SQLite database (default for this app)
-            db_path = os.environ.get('DATABASE_PATH', 'predictions.db')
-            start_time = time.time()
-            
-            conn = sqlite3.connect(db_path, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('SELECT 1')
-            cursor.fetchone()
-            conn.close()
-            
-            connection_time = time.time() - start_time
-            
-            # Check database file size and permissions
-            if os.path.exists(db_path):
-                db_size = os.path.getsize(db_path)
-                db_writable = os.access(db_path, os.W_OK)
-            else:
-                db_size = 0
-                db_writable = False
-            
-            DATABASE_CONNECTIONS.set(1)
-            
-            return {
-                'status': 'healthy',
-                'connection_time_ms': round(connection_time * 1000, 2),
-                'database': {
-                    'path': db_path,
-                    'size_bytes': db_size,
-                    'writable': db_writable,
-                    'connected': True
-                }
-            }
-            
-        except Exception as e:
-            DATABASE_CONNECTIONS.set(0)
-            return {
-                'status': 'unhealthy',
-                'error': str(e),
-                'database': {
-                    'connected': False
-                }
-            }
-
-    def _check_redis_health(self) -> Dict[str, Any]:
-        """Check Redis connectivity if available"""
-        if not REDIS_AVAILABLE:
-            REDIS_CONNECTION_STATUS.set(0)
-            return {
-                'status': 'unavailable',
-                'error': 'Redis package not installed',
-                'redis': {
-                    'connected': False,
-                    'available': False
-                }
-            }
+        values = [m.value for m in metrics]
+        result = {}
         
-        try:
-            redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379')
-            start_time = time.time()
-            
-            r = redis.from_url(redis_url, socket_timeout=5)
-            r.ping()
-            
-            connection_time = time.time() - start_time
-            info = r.info()
-            
-            REDIS_CONNECTION_STATUS.set(1)
-            
-            return {
-                'status': 'healthy',
-                'connection_time_ms': round(connection_time * 1000, 2),
-                'redis': {
-                    'connected': True,
-                    'available': True,
-                    'version': info.get('redis_version'),
-                    'used_memory': info.get('used_memory_human'),
-                    'connected_clients': info.get('connected_clients'),
-                    'uptime_seconds': info.get('uptime_in_seconds')
-                }
-            }
-            
-        except Exception as e:
-            REDIS_CONNECTION_STATUS.set(0)
-            return {
-                'status': 'unhealthy',
-                'error': str(e),
-                'redis': {
-                    'connected': False,
-                    'available': True
-                }
-            }
-
-    def _check_model_health(self) -> Dict[str, Any]:
-        """Check ML model status and performance"""
-        try:
-            model_path = 'model.pth'
-            model_loaded = os.path.exists(model_path)
-            
-            model_info = {
-                'loaded': model_loaded,
-                'path': model_path,
-                'size_bytes': os.path.getsize(model_path) if model_loaded else 0,
-                'last_modified': os.path.getmtime(model_path) if model_loaded else None
-            }
-            
-            # Check GPU availability and memory
-            gpu_info = {
-                'available': torch.cuda.is_available(),
-                'device_count': torch.cuda.device_count() if torch.cuda.is_available() else 0,
-                'memory_allocated': torch.cuda.memory_allocated() if torch.cuda.is_available() else 0,
-                'memory_cached': torch.cuda.memory_reserved() if torch.cuda.is_available() else 0
-            }
-            
-            # Get model accuracy if available
-            accuracy = MODEL_ACCURACY._value.get() if MODEL_ACCURACY._value else 0.0
-            
-            status = 'healthy' if model_loaded else 'unhealthy'
-            
-            return {
-                'status': status,
-                'model': model_info,
-                'gpu': gpu_info,
-                'accuracy': accuracy,
-                'inference_metrics': {
-                    'total_inferences': MODEL_INFERENCE_COUNT._value.get() if MODEL_INFERENCE_COUNT._value else 0,
-                    'average_duration': MODEL_INFERENCE_DURATION.observe if hasattr(MODEL_INFERENCE_DURATION, 'observe') else 0,
-                    'failure_count': MODEL_INFERENCE_FAILURES._value.get() if MODEL_INFERENCE_FAILURES._value else 0
-                }
-            }
-            
-        except Exception as e:
-            return {
-                'status': 'unhealthy',
-                'error': str(e),
-                'model': {
-                    'loaded': False
-                }
-            }
-
-    def _check_system_health(self) -> Dict[str, Any]:
-        """Check system resources and performance"""
-        try:
-            # CPU information
-            cpu_percent = psutil.cpu_percent(interval=1)
-            cpu_count = psutil.cpu_count()
-            cpu_freq = psutil.cpu_freq()
-            
-            # Memory information
-            memory = psutil.virtual_memory()
-            swap = psutil.swap_memory()
-            
-            # Disk information
-            disk = psutil.disk_usage('/')
-            disk_io = psutil.disk_io_counters()
-            
-            # Network information
-            network_io = psutil.net_io_counters()
-            
-            # Process information
-            process = psutil.Process()
-            process_memory = process.memory_info()
-            
-            # Temperature if available
-            temps = {}
+        for p in percentiles:
             try:
-                temps = psutil.sensors_temperatures()
-            except AttributeError:
-                pass
-            
-            # Boot time
-            boot_time = psutil.boot_time()
-            
-            return {
-                'status': 'healthy',
-                'timestamp': time.time(),
-                'uptime_seconds': time.time() - boot_time,
-                'cpu': {
-                    'percent': cpu_percent,
-                    'count': cpu_count,
-                    'frequency_mhz': cpu_freq.current if cpu_freq else None,
-                    'load_average': os.getloadavg() if hasattr(os, 'getloadavg') else None
-                },
-                'memory': {
-                    'total': memory.total,
-                    'available': memory.available,
-                    'percent': memory.percent,
-                    'used': memory.used,
-                    'swap_total': swap.total,
-                    'swap_used': swap.used,
-                    'swap_percent': swap.percent
-                },
-                'disk': {
-                    'total': disk.total,
-                    'used': disk.used,
-                    'free': disk.free,
-                    'percent': (disk.used / disk.total) * 100,
-                    'read_bytes': disk_io.read_bytes if disk_io else 0,
-                    'write_bytes': disk_io.write_bytes if disk_io else 0
-                },
-                'network': {
-                    'bytes_sent': network_io.bytes_sent if network_io else 0,
-                    'bytes_recv': network_io.bytes_recv if network_io else 0,
-                    'packets_sent': network_io.packets_sent if network_io else 0,
-                    'packets_recv': network_io.packets_recv if network_io else 0
-                },
-                'process': {
-                    'pid': process.pid,
-                    'memory_rss': process_memory.rss,
-                    'memory_vms': process_memory.vms,
-                    'cpu_percent': process.cpu_percent(),
-                    'num_threads': process.num_threads(),
-                    'create_time': process.create_time()
-                },
-                'temperature': temps
-            }
-            
-        except Exception as e:
-            return {
-                'status': 'unhealthy',
-                'error': str(e)
-            }
+                result[f"p{p}"] = statistics.percentile(values, p)
+            except Exception as e:
+                logger.error(f"Error calculating percentile {p}: {e}")
+                result[f"p{p}"] = 0.0
+        
+        return result
 
-    def _check_dependencies_health(self) -> Dict[str, Any]:
-        """Check external dependencies and services"""
-        dependencies = {}
+class AlertManager:
+    """Manages alerts and notifications"""
+    
+    def __init__(self):
+        self._alerts: Dict[str, Alert] = {}
+        self._alert_handlers: List[Callable] = []
+        self._lock = threading.RLock()
+    
+    def add_alert(self, alert: Alert):
+        """Add alert definition"""
+        with self._lock:
+            self._alerts[alert.name] = alert
+    
+    def remove_alert(self, name: str):
+        """Remove alert"""
+        with self._lock:
+            self._alerts.pop(name, None)
+    
+    def add_alert_handler(self, handler: Callable[[Alert], None]):
+        """Add alert notification handler"""
+        self._alert_handlers.append(handler)
+    
+    def check_alerts(self, metrics_collector: MetricsCollector):
+        """Check all alerts against current metrics"""
+        current_metrics = metrics_collector.get_current_metrics()
         
-        # Check Python version
-        dependencies['python'] = {
-            'version': sys.version,
-            'version_info': sys.version_info,
-            'status': 'healthy'
-        }
-        
-        # Check key packages
-        packages = ['flask', 'torch', 'psutil', 'prometheus_client', 'sqlite3']
-        if REDIS_AVAILABLE:
-            packages.append('redis')
-        
-        for package in packages:
-            try:
-                if package == 'sqlite3':
-                    import sqlite3
-                    version = sqlite3.sqlite_version
-                elif package == 'redis':
-                    version = redis.__version__ if redis else 'unknown'
-                else:
-                    module = __import__(package)
-                    version = getattr(module, '__version__', 'unknown')
+        with self._lock:
+            for alert in self._alerts.values():
+                if not alert.enabled:
+                    continue
                 
-                dependencies[package] = {
-                    'version': version,
-                    'status': 'healthy'
-                }
-            except ImportError as e:
-                dependencies[package] = {
-                    'version': None,
-                    'status': 'unhealthy',
-                    'error': str(e)
-                }
+                try:
+                    if self._evaluate_condition(alert.condition, alert.threshold, current_metrics):
+                        self._trigger_alert(alert)
+                except Exception as e:
+                    logger.error(f"Error evaluating alert {alert.name}: {e}")
+    
+    def _evaluate_condition(self, condition: str, threshold: float, metrics: Dict[str, Any]) -> bool:
+        """Evaluate alert condition"""
+        # Simple condition evaluation - can be extended with more complex logic
+        metric_name = condition.split()[0]  # Extract metric name
         
-        # Check environment variables
-        required_env_vars = ['SECRET_KEY', 'FLASK_ENV']
-        env_status = {}
-        for var in required_env_vars:
-            env_status[var] = {
-                'set': var in os.environ,
-                'value': os.environ.get(var, '')[:8] + '...' if var in os.environ and var == 'SECRET_KEY' else os.environ.get(var, '')
-            }
+        if metric_name in metrics:
+            current_value = metrics[metric_name]["value"]
+            
+            if ">" in condition:
+                return current_value > threshold
+            elif "<" in condition:
+                return current_value < threshold
+            elif ">=" in condition:
+                return current_value >= threshold
+            elif "<=" in condition:
+                return current_value <= threshold
+            elif "==" in condition:
+                return current_value == threshold
         
-        dependencies['environment'] = env_status
+        return False
+    
+    def _trigger_alert(self, alert: Alert):
+        """Trigger alert notification"""
+        alert.last_triggered = datetime.now()
+        alert.trigger_count += 1
         
-        # Overall status
-        overall_status = 'healthy'
-        for dep in dependencies.values():
-            if isinstance(dep, dict) and dep.get('status') == 'unhealthy':
-                overall_status = 'degraded'
-                break
+        logger.warning(f"Alert triggered: {alert.name} - {alert.message}")
         
-        return {
-            'status': overall_status,
-            'dependencies': dependencies
-        }
-
-def track_inference(func):
-    """Decorator to track model inference metrics"""
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        start_time = time.time()
-        status = 'success'
-        resp_obj = None
-        try:
-            result = func(*args, **kwargs)
+        for handler in self._alert_handlers:
             try:
                 resp_obj = make_response(result)
             except Exception:
@@ -601,6 +381,22 @@ DATA_QUALITY_SCORE = Gauge(
     'data_quality_score',
     'Overall data quality score (0-100)'
 )
+
+MISSING_DATA_RATE = Gauge(
+    'missing_data_rate',
+    'Rate of missing data in incoming requests'
+)
+
+DUPLICATE_DATA_RATE = Gauge(
+    'duplicate_data_rate',
+    'Rate of duplicate data detected'
+)
+
+DATA_DRIFT_SCORE = Gauge(
+    'data_drift_score',
+    'Data drift detection score'
+)
+
 
 MISSING_DATA_RATE = Gauge(
     'missing_data_rate',
@@ -703,6 +499,24 @@ class DataQualityMonitor:
     def _validate_image_data(self, image_data: Any) -> List[str]:
         """Validate image data"""
         errors = []
+        
+        try:
+            # Check image size
+            if hasattr(image_data, 'seek') and hasattr(image_data, 'tell'):
+                image_data.seek(0, 2)  # Seek to end
+                size = image_data.tell()
+                image_data.seek(0)  # Reset position
+                
+                min_size, max_size = self.validation_rules['image_size_range']
+                if size < min_size or size > max_size:
+                    errors.append(f"Image size {size} bytes is outside valid range [{min_size}, {max_size}]")
+            
+            # Check file format if filename is available
+            if hasattr(image_data, 'filename') and image_data.filename:
+                ext = image_data.filename.rsplit('.', 1)[1].lower() if '.' in image_data.filename else ''
+                if ext not in self.validation_rules['allowed_formats']:
+                    errors.append(f"Unsupported image format: {ext}")
+        
         
         try:
             # Check image size
@@ -893,3 +707,463 @@ def validate_data_quality(func):
             return {'error': f'Data quality validation failed: {str(e)}'}, 500
     
     return wrapper
+            
+        except Exception:
+            pass
+    
+    def detect_data_drift(self) -> Dict[str, Any]:
+        """Detect data drift using statistical methods"""
+        try:
+            if len(self.data_buffer) < 100:
+                return {'drift_detected': False, 'reason': 'Insufficient data'}
+            
+            # Get recent and historical data
+            recent_data = list(self.data_buffer)[-50:]  # Last 50 records
+            historical_data = list(self.data_buffer)[:-50]  # Everything before recent
+            
+            if len(historical_data) < 50:
+                return {'drift_detected': False, 'reason': 'Insufficient historical data'}
+            
+            # Compare quality scores
+            recent_scores = [d['quality_score'] for d in recent_data]
+            historical_scores = [d['quality_score'] for d in historical_data]
+            
+            # Statistical test for drift
+            recent_mean = np.mean(recent_scores)
+            historical_mean = np.mean(historical_scores)
+            
+            # Calculate drift score
+            drift_score = abs(recent_mean - historical_mean) / max(historical_mean, 1)
+            
+            # Update drift metric
+            DATA_DRIFT_SCORE.set(drift_score)
+            
+            drift_detected = drift_score > 0.15  # 15% change threshold
+            
+            return {
+                'drift_detected': drift_detected,
+                'drift_score': drift_score,
+                'recent_mean': recent_mean,
+                'historical_mean': historical_mean,
+                'sample_sizes': {'recent': len(recent_data), 'historical': len(historical_data)}
+            }
+        
+        except Exception as e:
+            return {'drift_detected': False, 'error': str(e)}
+    
+    def get_quality_report(self) -> Dict[str, Any]:
+        """Generate comprehensive data quality report"""
+        try:
+            if not self.data_buffer:
+                return {'status': 'no_data', 'message': 'No data available for analysis'}
+            
+            recent_data = list(self.data_buffer)[-100:]  # Last 100 records
+            
+            # Calculate statistics
+            quality_scores = [d['quality_score'] for d in recent_data]
+            timestamps = [d['timestamp'] for d in recent_data]
+            
+            report = {
+                'summary': {
+                    'total_records': len(recent_data),
+                    'avg_quality_score': np.mean(quality_scores),
+                    'min_quality_score': np.min(quality_scores),
+                    'max_quality_score': np.max(quality_scores),
+                    'time_range': {
+                        'start': min(timestamps).isoformat(),
+                        'end': max(timestamps).isoformat()
+                    }
+                },
+                'trends': {
+                    'quality_trend': 'improving' if len(quality_scores) > 1 and quality_scores[-1] > quality_scores[0] else 'declining',
+                    'data_volume_trend': 'increasing' if len(recent_data) > 50 else 'stable'
+                },
+                'issues': {
+                    'low_quality_records': len([s for s in quality_scores if s < 70]),
+                    'validation_errors': sum(1 for d in recent_data if d.get('validation_errors', 0) > 0),
+                    'duplicate_warnings': sum(1 for d in recent_data if 'duplicate' in str(d.get('warnings', [])))
+                },
+                'drift_analysis': self.detect_data_drift()
+            }
+            
+            return report
+        
+        except Exception as e:
+            return {'status': 'error', 'message': str(e)}
+
+# Global data quality monitor instance
+data_quality_monitor = DataQualityMonitor()
+
+def validate_data_quality(func):
+    """Decorator to validate data quality for API endpoints"""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            # Get request data
+            request_data = {}
+            
+            # Extract data from request
+            if request.files:
+                request_data.update(request.files.to_dict())
+            if request.form:
+                request_data.update(request.form.to_dict())
+            if request.get_json():
+                request_data.update(request.get_json())
+            
+            # Add metadata
+            request_data['timestamp'] = datetime.now().isoformat()
+            request_data['ip_address'] = request.remote_addr
+            request_data['user_agent'] = request.headers.get('User-Agent', '')
+            
+            # Validate data quality
+            validation_result = data_quality_monitor.validate_request_data(request_data)
+            
+            # Store validation result in request context for later use
+            request.data_quality = validation_result
+            
+            # If data quality is too low, you might want to reject the request
+            if validation_result['quality_score'] < 30:
+                return {
+                    'error': 'Data quality too low',
+                    'quality_score': validation_result['quality_score'],
+                    'errors': validation_result['errors']
+                }, 400
+            
+            return func(*args, **kwargs)
+        
+        except Exception as e:
+            return {'error': f'Data quality validation failed: {str(e)}'}, 500
+    
+    return wrapper
+                handler(alert)
+            except Exception as e:
+                logger.error(f"Error in alert handler: {e}")
+
+class QueueMonitor:
+    """Comprehensive queue monitoring system"""
+    
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        self.config = config or {}
+        self.metrics_collector = MetricsCollector(
+            max_history=self.config.get('max_history', 10000)
+        )
+        self.alert_manager = AlertManager()
+        
+        # Queue metrics tracking
+        self._queue_metrics: Dict[str, QueueMetrics] = {}
+        self._lock = threading.RLock()
+        
+        # Performance tracking
+        self._performance_window = deque(maxlen=1000)  # Last 1000 operations
+        
+        # Monitoring thread
+        self._monitoring_active = False
+        self._monitoring_thread = None
+        
+        # Setup default alerts
+        self._setup_default_alerts()
+    
+    def _setup_default_alerts(self):
+        """Setup default alert rules"""
+        default_alerts = [
+            Alert(
+                name="high_queue_size",
+                level=AlertLevel.WARNING,
+                condition="queue_size >",
+                threshold=1000,
+                message="Queue size is getting large"
+            ),
+            Alert(
+                name="high_error_rate",
+                level=AlertLevel.ERROR,
+                condition="error_rate >",
+                threshold=10.0,
+                message="Error rate is too high"
+            ),
+            Alert(
+                name="low_throughput",
+                level=AlertLevel.WARNING,
+                condition="throughput <",
+                threshold=1.0,
+                message="Queue throughput is too low"
+            ),
+            Alert(
+                name="high_processing_time",
+                level=AlertLevel.WARNING,
+                condition="avg_processing_time >",
+                threshold=30000,  # 30 seconds in ms
+                message="Average processing time is too high"
+            )
+        ]
+        
+        for alert in default_alerts:
+            self.alert_manager.add_alert(alert)
+    
+    def start_monitoring(self, interval_seconds: int = 30):
+        """Start background monitoring"""
+        if self._monitoring_active:
+            return
+        
+        self._monitoring_active = True
+        self._monitoring_thread = threading.Thread(
+            target=self._monitoring_loop,
+            args=(interval_seconds,),
+            daemon=True
+        )
+        self._monitoring_thread.start()
+        logger.info("Queue monitoring started")
+    
+    def stop_monitoring(self):
+        """Stop background monitoring"""
+        self._monitoring_active = False
+        if self._monitoring_thread:
+            self._monitoring_thread.join(timeout=5)
+        logger.info("Queue monitoring stopped")
+    
+    def _monitoring_loop(self, interval_seconds: int):
+        """Background monitoring loop"""
+        while self._monitoring_active:
+            try:
+                self._collect_metrics()
+                self.alert_manager.check_alerts(self.metrics_collector)
+                time.sleep(interval_seconds)
+            except Exception as e:
+                logger.error(f"Monitoring loop error: {e}")
+                time.sleep(5)
+    
+    def _collect_metrics(self):
+        """Collect current metrics from all queues"""
+        with self._lock:
+            for queue_name, metrics in self._queue_metrics.items():
+                labels = {"queue": queue_name}
+                
+                # Record queue metrics
+                self.metrics_collector.set_gauge("queue_size", metrics.pending_tasks, labels)
+                self.metrics_collector.set_gauge("running_tasks", metrics.running_tasks, labels)
+                self.metrics_collector.set_gauge("completed_tasks", metrics.completed_tasks, labels)
+                self.metrics_collector.set_gauge("failed_tasks", metrics.failed_tasks, labels)
+                self.metrics_collector.set_gauge("error_rate", metrics.error_rate, labels)
+                self.metrics_collector.set_gauge("throughput", metrics.throughput, labels)
+                self.metrics_collector.set_gauge("avg_wait_time", metrics.average_wait_time, labels)
+                self.metrics_collector.set_gauge("avg_processing_time", metrics.average_processing_time, labels)
+    
+    def update_queue_metrics(self, queue_name: str, **kwargs):
+        """Update metrics for a specific queue"""
+        with self._lock:
+            if queue_name not in self._queue_metrics:
+                self._queue_metrics[queue_name] = QueueMetrics(queue_name=queue_name)
+            
+            metrics = self._queue_metrics[queue_name]
+            
+            # Update metrics
+            for key, value in kwargs.items():
+                if hasattr(metrics, key):
+                    setattr(metrics, key, value)
+            
+            metrics.last_updated = datetime.now()
+            
+            # Record performance data
+            self._record_performance(queue_name, metrics)
+    
+    def _record_performance(self, queue_name: str, metrics: QueueMetrics):
+        """Record performance data point"""
+        performance_data = {
+            'timestamp': datetime.now(),
+            'queue': queue_name,
+            'throughput': metrics.throughput,
+            'error_rate': metrics.error_rate,
+            'avg_processing_time': metrics.average_processing_time,
+            'pending_tasks': metrics.pending_tasks
+        }
+        
+        self._performance_window.append(performance_data)
+    
+    def record_task_event(self, queue_name: str, event_type: str, duration_ms: Optional[float] = None):
+        """Record task-related events"""
+        labels = {"queue": queue_name, "event": event_type}
+        
+        if event_type == "completed":
+            self.metrics_collector.record_counter("tasks_completed", 1.0, labels)
+            if duration_ms is not None:
+                self.metrics_collector.record_timer("task_duration", duration_ms, labels)
+        elif event_type == "failed":
+            self.metrics_collector.record_counter("tasks_failed", 1.0, labels)
+        elif event_type == "started":
+            self.metrics_collector.record_counter("tasks_started", 1.0, labels)
+        elif event_type == "queued":
+            self.metrics_collector.record_counter("tasks_queued", 1.0, labels)
+    
+    def get_queue_metrics(self, queue_name: str) -> Optional[QueueMetrics]:
+        """Get metrics for a specific queue"""
+        with self._lock:
+            return self._queue_metrics.get(queue_name)
+    
+    def get_all_queue_metrics(self) -> Dict[str, QueueMetrics]:
+        """Get metrics for all queues"""
+        with self._lock:
+            return self._queue_metrics.copy()
+    
+    def get_performance_summary(self, hours: int = 24) -> Dict[str, Any]:
+        """Get performance summary for the last N hours"""
+        cutoff_time = datetime.now() - timedelta(hours=hours)
+        
+        # Filter performance data
+        recent_data = [
+            data for data in self._performance_window
+            if data['timestamp'] >= cutoff_time
+        ]
+        
+        if not recent_data:
+            return {}
+        
+        # Calculate summary statistics
+        throughputs = [data['throughput'] for data in recent_data]
+        error_rates = [data['error_rate'] for data in recent_data]
+        processing_times = [data['avg_processing_time'] for data in recent_data]
+        
+        return {
+            'period_hours': hours,
+            'total_data_points': len(recent_data),
+            'throughput': {
+                'avg': statistics.mean(throughputs),
+                'min': min(throughputs),
+                'max': max(throughputs),
+                'median': statistics.median(throughputs)
+            },
+            'error_rate': {
+                'avg': statistics.mean(error_rates),
+                'min': min(error_rates),
+                'max': max(error_rates),
+                'median': statistics.median(error_rates)
+            },
+            'processing_time': {
+                'avg': statistics.mean(processing_times),
+                'min': min(processing_times),
+                'max': max(processing_times),
+                'median': statistics.median(processing_times)
+            }
+        }
+    
+    def get_queue_analytics(self, queue_name: str, hours: int = 24) -> Dict[str, Any]:
+        """Get detailed analytics for a specific queue"""
+        metrics = self.get_queue_metrics(queue_name)
+        if not metrics:
+            return {}
+        
+        # Get task duration percentiles
+        duration_percentiles = self.metrics_collector.calculate_percentiles(
+            "task_duration", labels={"queue": queue_name}
+        )
+        
+        # Get task counts by event type
+        task_events = {}
+        for event_type in ["completed", "failed", "started", "queued"]:
+            history = self.metrics_collector.get_metric_history(
+                "tasks_completed" if event_type == "completed" else f"tasks_{event_type}",
+                labels={"queue": queue_name}
+            )
+            task_events[event_type] = len(history)
+        
+        return {
+            'queue_name': queue_name,
+            'current_metrics': {
+                'pending_tasks': metrics.pending_tasks,
+                'running_tasks': metrics.running_tasks,
+                'completed_tasks': metrics.completed_tasks,
+                'failed_tasks': metrics.failed_tasks,
+                'error_rate': metrics.error_rate,
+                'throughput': metrics.throughput,
+                'avg_wait_time': metrics.average_wait_time,
+                'avg_processing_time': metrics.average_processing_time
+            },
+            'task_events': task_events,
+            'duration_percentiles': duration_percentiles,
+            'last_updated': metrics.last_updated.isoformat()
+        }
+    
+    def export_metrics(self, format: str = "json") -> str:
+        """Export metrics in specified format"""
+        all_metrics = self.metrics_collector.get_current_metrics()
+        
+        if format.lower() == "json":
+            return json.dumps(all_metrics, indent=2, default=str)
+        elif format.lower() == "prometheus":
+            return self._export_prometheus_format(all_metrics)
+        else:
+            raise ValueError(f"Unsupported export format: {format}")
+    
+    def _export_prometheus_format(self, metrics: Dict[str, Any]) -> str:
+        """Export metrics in Prometheus format"""
+        lines = []
+        
+        for metric_name, metric_data in metrics.items():
+            metric_type = metric_data["type"]
+            value = metric_data["value"]
+            
+            # Add metric type
+            if metric_type == "counter":
+                lines.append(f"# TYPE {metric_name} counter")
+            elif metric_type == "gauge":
+                lines.append(f"# TYPE {metric_name} gauge")
+            
+            # Add metric value
+            lines.append(f"{metric_name} {value}")
+        
+        return "\n".join(lines)
+    
+    def reset_metrics(self):
+        """Reset all metrics"""
+        with self._lock:
+            self.metrics_collector = MetricsCollector(
+                max_history=self.config.get('max_history', 10000)
+            )
+            self._queue_metrics.clear()
+            self._performance_window.clear()
+        
+        logger.info("All metrics reset")
+
+# Alert handlers
+def console_alert_handler(alert: Alert):
+    """Simple console alert handler"""
+    print(f"[{alert.level.value.upper()}] {alert.name}: {alert.message}")
+
+def log_alert_handler(alert: Alert):
+    """Logging alert handler"""
+    if alert.level == AlertLevel.INFO:
+        logger.info(f"Alert: {alert.name} - {alert.message}")
+    elif alert.level == AlertLevel.WARNING:
+        logger.warning(f"Alert: {alert.name} - {alert.message}")
+    elif alert.level == AlertLevel.ERROR:
+        logger.error(f"Alert: {alert.name} - {alert.message}")
+    elif alert.level == AlertLevel.CRITICAL:
+        logger.critical(f"Alert: {alert.name} - {alert.message}")
+
+class QueueDashboard:
+    """Simple dashboard data provider for queue monitoring"""
+    
+    def __init__(self, monitor: QueueMonitor):
+        self.monitor = monitor
+    
+    def get_dashboard_data(self) -> Dict[str, Any]:
+        """Get data for dashboard display"""
+        queue_metrics = self.monitor.get_all_queue_metrics()
+        performance_summary = self.monitor.get_performance_summary()
+        
+        return {
+            'timestamp': datetime.now().isoformat(),
+            'queues': {
+                name: {
+                    'pending_tasks': metrics.pending_tasks,
+                    'running_tasks': metrics.running_tasks,
+                    'completed_tasks': metrics.completed_tasks,
+                    'failed_tasks': metrics.failed_tasks,
+                    'error_rate': metrics.error_rate,
+                    'throughput': metrics.throughput,
+                    'avg_processing_time': metrics.average_processing_time
+                }
+                for name, metrics in queue_metrics.items()
+            },
+            'performance_summary': performance_summary,
+            'total_queues': len(queue_metrics),
+            'monitoring_active': self.monitor._monitoring_active
+        }
