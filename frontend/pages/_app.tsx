@@ -1,4 +1,6 @@
 import "@/styles/globals.css";
+import "@/styles/accessibility.css";
+import "@/styles/mobile-responsive.css";
 import type { AppProps } from "next/app";
 import ErrorBoundary from "@/components/ErrorBoundary";
 import { ThemeProvider } from "@/components/ThemeProvider";
