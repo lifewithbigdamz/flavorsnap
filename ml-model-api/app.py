@@ -3,6 +3,14 @@ from PIL import Image
 import io
 import os
 import sys
+
+# Add the parent directory to the path to import config modules
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from config_manager import get_config, get_config_value
+from logger_config import get_logger
+from db_config import db_config, init_database
+
 import hashlib
 from datetime import datetime
 
@@ -605,6 +613,8 @@ if __name__ == '__main__':
         logger.error(f"Failed to start application: {e}")
         sys.exit(1)
     finally:
+        # Cleanup resources
+        config.cleanup()
         # Cleanup queue management resources
         logger.info("Shutting down queue management components")
         
