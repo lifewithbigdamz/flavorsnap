@@ -1,97 +1,262 @@
-import React, { useMemo } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useTranslation } from 'next-i18next';
-import { ClassificationResult as IClassificationResult } from '../types';
 
-interface ClassificationResultProps {
-  result: IClassificationResult;
-  loading?: boolean;
+interface Prediction {
+  class: string;
+  confidence: number;
 }
 
-export function ClassificationResult({ result, loading = false }: ClassificationResultProps) {
+interface ClassificationResultProps {
+  predictions: Prediction[];
+  loading?: boolean;
+  imageUrl?: string;
+}
+
+export function ClassificationResult({ predictions = [], loading = false, imageUrl }: ClassificationResultProps) {
   const { t } = useTranslation('common');
+  const [animatedConfidence, setAnimatedConfidence] = useState(0);
+  const [showParticles, setShowParticles] = useState(false);
+  const [isReducedMotion, setIsReducedMotion] = useState(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const animationRef = useRef<number | null>(null);
 
-  const confidencePercentage = useMemo(() => 
-    Math.round(result.confidence * 100), 
-    [result.confidence]
-  );
+  // Check for reduced motion preference
+  useEffect(() => {
+    const mediaQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+    setIsReducedMotion(mediaQuery.matches);
+    
+    const handleChange = (e: MediaQueryListEvent) => {
+      setIsReducedMotion(e.matches);
+    };
+    
+    mediaQuery.addEventListener('change', handleChange);
+    return () => mediaQuery.removeEventListener('change', handleChange);
+  }, []);
 
-  const getConfidenceLevel = (confidence: number) => {
-    if (confidence > 0.8) return 'high';
-    if (confidence > 0.5) return 'medium';
-    return 'low';
+  // Animate confidence score
+  useEffect(() => {
+    if (predictions.length > 0 && !loading) {
+      const targetConfidence = predictions[0]?.confidence || 0;
+      const duration = isReducedMotion ? 0 : 1500; // 1.5s animation
+      const startTime = Date.now();
+      
+      const animate = () => {
+        const elapsed = Date.now() - startTime;
+        const progress = Math.min(elapsed / duration, 1);
+        
+        // Easing function for smooth animation
+        const easeOutQuart = 1 - Math.pow(1 - progress, 4);
+        setAnimatedConfidence(targetConfidence * easeOutQuart);
+        
+        if (progress < 1) {
+          animationRef.current = requestAnimationFrame(animate);
+        }
+      };
+      
+      if (duration > 0) {
+        animationRef.current = requestAnimationFrame(animate);
+      } else {
+        setAnimatedConfidence(targetConfidence);
+      }
+      
+      // Show particles for high confidence
+      if (targetConfidence > 0.8 && !isReducedMotion) {
+        setShowParticles(true);
+        setTimeout(() => setShowParticles(false), 3000);
+      }
+      
+      // Play sound effect for high confidence
+      if (targetConfidence > 0.8 && !isReducedMotion) {
+        playSuccessSound();
+      }
+    }
+    
+    return () => {
+      if (animationRef.current) {
+        cancelAnimationFrame(animationRef.current);
+      }
+    };
+  }, [predictions, loading, isReducedMotion]);
+
+  const playSuccessSound = useCallback(() => {
+    // Create a simple success sound using Web Audio API
+    try {
+      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const oscillator = audioContext.createOscillator();
+      const gainNode = audioContext.createGain();
+      
+      oscillator.connect(gainNode);
+      gainNode.connect(audioContext.destination);
+      
+      oscillator.frequency.setValueAtTime(523.25, audioContext.currentTime); // C5
+      oscillator.frequency.setValueAtTime(659.25, audioContext.currentTime + 0.1); // E5
+      oscillator.frequency.setValueAtTime(783.99, audioContext.currentTime + 0.2); // G5
+      
+      gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+      gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.3);
+      
+      oscillator.start(audioContext.currentTime);
+      oscillator.stop(audioContext.currentTime + 0.3);
+    } catch (error) {
+      console.log('Audio playback not supported');
+    }
+  }, []);
+
+  const getConfidenceColor = (confidence: number) => {
+    if (confidence > 0.8) return 'text-green-500';
+    if (confidence > 0.6) return 'text-yellow-500';
+    return 'text-red-500';
   };
 
-  const confidenceLevel = getConfidenceLevel(result.confidence);
+  const getProgressColor = (confidence: number) => {
+    if (confidence > 0.8) return '#10b981'; // green-500
+    if (confidence > 0.6) return '#eab308'; // yellow-500
+    return '#ef4444'; // red-500
+  };
+
+  // Loading skeleton
+  if (loading) {
+    return (
+      <div className="w-full max-w-md mx-auto p-6 bg-white dark:bg-gray-800 rounded-2xl shadow-lg">
+        <div className="animate-pulse">
+          <div className="h-32 bg-gray-200 dark:bg-gray-700 rounded-lg mb-4"></div>
+          <div className="h-4 bg-gray-200 dark:bg-gray-700 rounded mb-2"></div>
+          <div className="h-4 bg-gray-200 dark:bg-gray-700 rounded w-3/4"></div>
+        </div>
+      </div>
+    );
+  }
+
+  if (predictions.length === 0) {
+    return null;
+  }
+
+  const topPrediction = predictions[0];
+  const top3Predictions = predictions.slice(0, 3);
 
   return (
-    <div 
-      className="w-full bg-white dark:bg-gray-800 rounded-[2rem] shadow-2xl p-6 sm:p-8 border border-gray-100 dark:border-gray-700 animate-scale-in"
-      role="region"
-      aria-labelledby="result-title"
-    >
-      <h3 id="result-title" className="text-xl sm:text-2xl font-black text-gray-900 dark:text-white mb-6 flex items-center gap-3">
-        <div className="w-8 h-8 bg-emerald-500 rounded-full flex items-center justify-center text-white text-sm" aria-hidden="true">✓</div>
-        {t('classification_result', 'Analysis Results')}
-      </h3>
+    <div className="w-full max-w-md mx-auto p-6 bg-white dark:bg-gray-800 rounded-2xl shadow-lg relative overflow-hidden">
+      {/* Particle Effects */}
+      {showParticles && !isReducedMotion && (
+        <div className="absolute inset-0 pointer-events-none">
+          {[...Array(12)].map((_, i) => (
+            <div
+              key={i}
+              className="absolute w-2 h-2 bg-yellow-400 rounded-full animate-ping"
+              style={{
+                left: `${20 + (i % 4) * 20}%`,
+                top: `${20 + Math.floor(i / 4) * 20}%`,
+                animationDelay: `${i * 0.1}s`,
+                animationDuration: '1.5s'
+              }}
+            />
+          ))}
+        </div>
+      )}
 
-      <div className="space-y-6">
-        {/* Main Prediction */}
-        <div 
-          className="bg-emerald-50/50 dark:bg-emerald-900/10 p-6 rounded-3xl flex flex-col sm:flex-row justify-between items-center border border-emerald-100/30 dark:border-emerald-800/20 gap-4"
-          aria-live="polite"
-        >
-          <div className="text-center sm:text-left">
-            <p className="text-[10px] text-emerald-600 dark:text-emerald-400 font-black uppercase tracking-[0.2em] mb-1">
-              {t('result_label', 'Detected Food')}
-            </p>
-            <p className="text-3xl sm:text-4xl font-black text-indigo-900 dark:text-indigo-100 capitalize">
-              {result.food || result.prediction}
-            </p>
+      {/* Main Result */}
+      <div className="text-center mb-6">
+        <h3 className="text-lg font-semibold text-gray-800 dark:text-gray-200 mb-2">
+          {t('classification_result')}
+        </h3>
+        
+        {/* Circular Progress Indicator */}
+        <div className="relative inline-flex items-center justify-center w-32 h-32 mb-4">
+          <svg className="transform -rotate-90 w-32 h-32">
+            {/* Background circle */}
+            <circle
+              cx="64"
+              cy="64"
+              r="56"
+              stroke="currentColor"
+              strokeWidth="8"
+              fill="none"
+              className="text-gray-200 dark:text-gray-700"
+            />
+            {/* Progress circle */}
+            <circle
+              cx="64"
+              cy="64"
+              r="56"
+              stroke={getProgressColor(animatedConfidence)}
+              strokeWidth="8"
+              fill="none"
+              strokeDasharray={`${2 * Math.PI * 56}`}
+              strokeDashoffset={`${2 * Math.PI * 56 * (1 - animatedConfidence)}`}
+              className={`transition-all duration-300 ${!isReducedMotion ? 'ease-out' : ''}`}
+              strokeLinecap="round"
+            />
+          </svg>
+          <div className="absolute inset-0 flex flex-col items-center justify-center">
+            <span className={`text-3xl font-bold ${getConfidenceColor(animatedConfidence)}`}>
+              {Math.round(animatedConfidence * 100)}%
+            </span>
+            <span className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+              {t('confidence')}
+            </span>
           </div>
-          
-          <div className="text-center sm:text-right">
-            <p className="text-[10px] text-emerald-600 dark:text-emerald-400 font-black uppercase tracking-[0.2em] mb-1">
-              {t('result_confidence', 'Confidence')}
-            </p>
-            <div className="flex items-center gap-2 justify-center sm:justify-end">
-              <p className={`text-3xl sm:text-4xl font-black ${
-                confidenceLevel === 'high' ? 'text-emerald-600' : 
-                confidenceLevel === 'medium' ? 'text-orange-500' : 'text-red-500'
+        </div>
+
+        {/* Top Prediction */}
+        <div className="mb-4">
+          <h4 className="text-2xl font-bold text-gray-800 dark:text-gray-200">
+            {topPrediction.class}
+          </h4>
+          <p className={`text-sm font-medium ${getConfidenceColor(topPrediction.confidence)}`}>
+            {Math.round(topPrediction.confidence * 100)}% {t('confidence')}
+          </p>
+        </div>
+      </div>
+
+      {/* Top 3 Predictions Breakdown */}
+      <div className="space-y-3">
+        <h4 className="text-sm font-semibold text-gray-600 dark:text-gray-400 uppercase tracking-wider">
+          {t('top_predictions')}
+        </h4>
+        {top3Predictions.map((prediction, index) => (
+          <div key={index} className="flex items-center justify-between">
+            <div className="flex items-center space-x-3">
+              <div className={`w-8 h-8 rounded-full flex items-center justify-center text-white text-sm font-bold ${
+                index === 0 ? 'bg-yellow-500' : 
+                index === 1 ? 'bg-gray-400' : 
+                'bg-orange-600'
               }`}>
-                {confidencePercentage}%
-              </p>
+                {index + 1}
+              </div>
+              <span className="text-gray-700 dark:text-gray-300 font-medium">
+                {prediction.class}
+              </span>
+            </div>
+            <div className="flex items-center space-x-2">
+              <div className="w-24 bg-gray-200 dark:bg-gray-700 rounded-full h-2 overflow-hidden">
+                <div
+                  className={`h-full transition-all duration-500 ${!isReducedMotion ? 'ease-out' : ''}`}
+                  style={{
+                    width: `${prediction.confidence * 100}%`,
+                    backgroundColor: getProgressColor(prediction.confidence)
+                  }}
+                />
+              </div>
+              <span className={`text-sm font-medium ${getConfidenceColor(prediction.confidence)} w-12 text-right`}>
+                {Math.round(prediction.confidence * 100)}%
+              </span>
             </div>
           </div>
-        </div>
-
-        {/* Nutritional Insights (Simulated for Now) */}
-        {result.calories && (
-          <div className="p-4 bg-orange-50/50 dark:bg-orange-900/10 rounded-2xl border border-orange-100/30 dark:border-orange-800/20 flex items-center justify-center gap-3">
-            <span className="text-2xl" aria-hidden="true">🔥</span>
-            <p className="text-sm sm:text-base text-gray-700 dark:text-gray-300 font-bold">
-              {t('estimated_calories', 'Estimated Calories')}: 
-              <span className="text-orange-600 dark:text-orange-400 font-black text-xl ml-2">
-                {result.calories} kcal
-              </span>
-            </p>
-          </div>
-        )}
-
-        {/* Accessibility Announcement for Screen Readers */}
-        <div className="sr-only" aria-live="assertive">
-          {t('classification_announcement', 'Classification complete. Found {{food}} with {{confidence}}% confidence.', {
-            food: result.food || result.prediction,
-            confidence: confidencePercentage
-          })}
-        </div>
-
-        {/* Processing Details */}
-        {result.processing_time && (
-          <p className="text-[10px] text-gray-400 dark:text-gray-500 text-center uppercase tracking-widest">
-            {t('processed_in', 'Processed in {{time}}ms', { time: Math.round(result.processing_time) })}
-          </p>
-        )}
+        ))}
       </div>
+
+      {/* Image Preview */}
+      {imageUrl && (
+        <div className="mt-6 pt-6 border-t border-gray-200 dark:border-gray-700">
+          <div className="relative w-full h-32 rounded-lg overflow-hidden">
+            <img
+              src={imageUrl}
+              alt="Classified food"
+              className="w-full h-full object-cover"
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }

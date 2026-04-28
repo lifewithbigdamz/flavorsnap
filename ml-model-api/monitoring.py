@@ -392,10 +392,22 @@ DUPLICATE_DATA_RATE = Gauge(
     'Rate of duplicate data detected'
 )
 
+
+MISSING_DATA_RATE = Gauge(
+    'missing_data_rate',
+    'Rate of missing data in incoming requests'
+)
+
+DUPLICATE_DATA_RATE = Gauge(
+    'duplicate_data_rate',
+    'Rate of duplicate data detected'
+)
+
 DATA_DRIFT_SCORE = Gauge(
     'data_drift_score',
     'Data drift detection score'
 )
+
 
 
 MISSING_DATA_RATE = Gauge(
@@ -517,6 +529,40 @@ class DataQualityMonitor:
                 if ext not in self.validation_rules['allowed_formats']:
                     errors.append(f"Unsupported image format: {ext}")
         
+        except Exception as e:
+            errors.append(f"Image validation error: {str(e)}")
+        
+        return errors
+    
+    def _is_duplicate(self, request_data: Dict[str, Any]) -> bool:
+        """Check for duplicate data"""
+        try:
+            # Create a hash of key fields for duplicate detection
+            key_fields = []
+            if 'image' in request_data and hasattr(request_data['image'], 'filename'):
+                key_fields.append(request_data['image'].filename)
+            if 'timestamp' in request_data:
+                key_fields.append(str(request_data['timestamp']))
+            
+            if key_fields:
+                data_hash = hash(tuple(key_fields))
+                if data_hash in self.duplicate_detector:
+                    return True
+                self.duplicate_detector.add(data_hash)
+                
+                # Clean old hashes to prevent memory issues
+                if len(self.duplicate_detector) > 10000:
+                    # Keep only recent half
+                    self.duplicate_detector = set(list(self.duplicate_detector)[-5000:])
+        
+        except Exception:
+            pass
+        
+        return False
+    
+    def _update_quality_metrics(self, validation_result: Dict[str, Any]):
+        """Update data quality metrics"""
+        try:
         
         try:
             # Check image size
@@ -579,6 +625,10 @@ class DataQualityMonitor:
             # Calculate duplicate rate
             duplicate_rate = 1.0 if any('duplicate' in w.lower() for w in validation_result['warnings']) else 0.0
             DUPLICATE_DATA_RATE.set(duplicate_rate)
+            
+        except Exception:
+            pass
+    
             
         except Exception:
             pass
@@ -716,6 +766,125 @@ def validate_data_quality(func):
         try:
             if len(self.data_buffer) < 100:
                 return {'drift_detected': False, 'reason': 'Insufficient data'}
+            
+            # Get recent and historical data
+            recent_data = list(self.data_buffer)[-50:]  # Last 50 records
+            historical_data = list(self.data_buffer)[:-50]  # Everything before recent
+            
+            if len(historical_data) < 50:
+                return {'drift_detected': False, 'reason': 'Insufficient historical data'}
+            
+            # Compare quality scores
+            recent_scores = [d['quality_score'] for d in recent_data]
+            historical_scores = [d['quality_score'] for d in historical_data]
+            
+            # Statistical test for drift
+            recent_mean = np.mean(recent_scores)
+            historical_mean = np.mean(historical_scores)
+            
+            # Calculate drift score
+            drift_score = abs(recent_mean - historical_mean) / max(historical_mean, 1)
+            
+            # Update drift metric
+            DATA_DRIFT_SCORE.set(drift_score)
+            
+            drift_detected = drift_score > 0.15  # 15% change threshold
+            
+            return {
+                'drift_detected': drift_detected,
+                'drift_score': drift_score,
+                'recent_mean': recent_mean,
+                'historical_mean': historical_mean,
+                'sample_sizes': {'recent': len(recent_data), 'historical': len(historical_data)}
+            }
+        
+        except Exception as e:
+            return {'drift_detected': False, 'error': str(e)}
+    
+    def get_quality_report(self) -> Dict[str, Any]:
+        """Generate comprehensive data quality report"""
+        try:
+            if not self.data_buffer:
+                return {'status': 'no_data', 'message': 'No data available for analysis'}
+            
+            recent_data = list(self.data_buffer)[-100:]  # Last 100 records
+            
+            # Calculate statistics
+            quality_scores = [d['quality_score'] for d in recent_data]
+            timestamps = [d['timestamp'] for d in recent_data]
+            
+            report = {
+                'summary': {
+                    'total_records': len(recent_data),
+                    'avg_quality_score': np.mean(quality_scores),
+                    'min_quality_score': np.min(quality_scores),
+                    'max_quality_score': np.max(quality_scores),
+                    'time_range': {
+                        'start': min(timestamps).isoformat(),
+                        'end': max(timestamps).isoformat()
+                    }
+                },
+                'trends': {
+                    'quality_trend': 'improving' if len(quality_scores) > 1 and quality_scores[-1] > quality_scores[0] else 'declining',
+                    'data_volume_trend': 'increasing' if len(recent_data) > 50 else 'stable'
+                },
+                'issues': {
+                    'low_quality_records': len([s for s in quality_scores if s < 70]),
+                    'validation_errors': sum(1 for d in recent_data if d.get('validation_errors', 0) > 0),
+                    'duplicate_warnings': sum(1 for d in recent_data if 'duplicate' in str(d.get('warnings', [])))
+                },
+                'drift_analysis': self.detect_data_drift()
+            }
+            
+            return report
+        
+        except Exception as e:
+            return {'status': 'error', 'message': str(e)}
+
+# Global data quality monitor instance
+data_quality_monitor = DataQualityMonitor()
+
+def validate_data_quality(func):
+    """Decorator to validate data quality for API endpoints"""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            # Get request data
+            request_data = {}
+            
+            # Extract data from request
+            if request.files:
+                request_data.update(request.files.to_dict())
+            if request.form:
+                request_data.update(request.form.to_dict())
+            if request.get_json():
+                request_data.update(request.get_json())
+            
+            # Add metadata
+            request_data['timestamp'] = datetime.now().isoformat()
+            request_data['ip_address'] = request.remote_addr
+            request_data['user_agent'] = request.headers.get('User-Agent', '')
+            
+            # Validate data quality
+            validation_result = data_quality_monitor.validate_request_data(request_data)
+            
+            # Store validation result in request context for later use
+            request.data_quality = validation_result
+            
+            # If data quality is too low, you might want to reject the request
+            if validation_result['quality_score'] < 30:
+                return {
+                    'error': 'Data quality too low',
+                    'quality_score': validation_result['quality_score'],
+                    'errors': validation_result['errors']
+                }, 400
+            
+            return func(*args, **kwargs)
+        
+        except Exception as e:
+            return {'error': f'Data quality validation failed: {str(e)}'}, 500
+    
+    return wrapper
             
             # Get recent and historical data
             recent_data = list(self.data_buffer)[-50:]  # Last 50 records
