@@ -1,4 +1,6 @@
-from flask import Flask, request, jsonify
+import torch
+import torch.nn as nn
+from torchvision import models, transforms
 from PIL import Image
 import io
 import os
@@ -149,6 +151,8 @@ def reload_config():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/predict', methods=['POST'])
+@tiered_rate_limit('predict')
+@require_api_key
 def predict():
     """Food classification prediction endpoint with queue support"""
     if 'image' not in request.files:
